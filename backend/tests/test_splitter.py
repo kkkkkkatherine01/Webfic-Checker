@@ -76,7 +76,8 @@ def test_parse_number():
     from webfic.ingest.splitter import parse_number
 
     cases = {"12": 12, "十": 10, "十二": 12, "二十": 20, "一百零五": 105, "两千": 2000,
-             "一万二千": 12000, "三十六": 36, "〇": 0}  # fmt: skip
+             "一万二千": 12000, "三十六": 36, "〇": 0,
+             "三六七": 367, "二七零": 270, "一〇五": 105}  # fmt: skip
     for text, n in cases.items():
         assert parse_number(text) == n, text
     assert parse_number("甲") is None
@@ -106,3 +107,41 @@ def test_repeated_and_skipped_numbers_are_accepted_when_short():
 def test_far_jump_is_not_a_heading():
     text = "第3章 甲\n甲。\n第九十九章\n乙。"
     assert [c.title for c in split_chapters(text).chapters] == ["第3章 甲"]
+
+
+# --- real web-novel layouts (found on WebNovelBench) ---------------------------------
+
+
+def test_heading_with_volume_prefix():
+    text = "第二卷 第五章 雪夜\n甲。\n第二卷 第六章 渡口\n乙。"
+    chapters = split_chapters(text).chapters
+    assert [c.title for c in chapters] == ["第二卷 第五章 雪夜", "第二卷 第六章 渡口"]
+    assert [c.content for c in chapters] == ["甲。", "乙。"]
+
+
+def test_heading_with_named_volume_prefix_and_positional_digits():
+    text = "第四卷 远行 第二九八章 起风\n甲。\n第四卷 远行 第二九九章 停船\n乙。"
+    assert len(split_chapters(text).chapters) == 2
+
+
+def test_new_volume_prefix_restarts_numbering():
+    text = "第一卷 第九章 甲\n甲。\n第二卷 第一章 乙\n乙。"
+    assert len(split_chapters(text).chapters) == 2
+
+
+def test_titled_heading_with_a_numbering_typo_is_still_a_heading():
+    text = "第一百二十章 甲\n甲。\n第一二十一章 乙\n乙。\n第一百二十二章 丙\n丙。"
+    chapters = split_chapters(text).chapters
+    assert [c.content for c in chapters] == ["甲。", "乙。", "丙。"]
+
+
+def test_titled_heading_restarting_at_one_without_volume_line():
+    text = "第四十章 甲\n甲。\n第一章 乙\n乙。\n第二章 丙\n丙。"
+    assert len(split_chapters(text).chapters) == 3
+
+
+def test_untitled_or_sentence_like_out_of_sequence_lines_stay_body_text():
+    text = "第八章 甲\n第三章 里的伏笔，终于揭开了。\n第二章\n甲。"
+    chapters = split_chapters(text).chapters
+    assert len(chapters) == 1
+    assert "第三章 里的伏笔" in chapters[0].content and "第二章" in chapters[0].content

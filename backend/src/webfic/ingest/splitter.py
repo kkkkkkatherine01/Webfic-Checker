@@ -24,6 +24,17 @@ VOLUME_HEADING = re.compile(rf"^第{_NUM}[卷部集](?!的)")
 # line, or else the line has no sentence punctuation ("第一卷风起云涌").
 _VOLUME_SEPARATED = re.compile(rf"^第{_NUM}[卷部集](?:$|[\s:：·、—\-．.（(【\[])")
 _SENTENCE_PUNCT = re.compile(r"[，。！？；…,!?;]")
+# "第一卷 第七章 浮游世界", "第三卷 途漫漫 第三六七章 久违了": a chapter heading carrying
+# its volume. Group 1 is the volume number, group 2 the chapter heading proper.
+_VOLUME_PREFIXED = re.compile(
+    rf"^第({_NUM})[卷部集](?:[\s:：·、—\-．.]\S{{0,12}})?\s*(第{_NUM}[章节回].*)$"
+)
+# A heading in its full form: number, then a separator, then a title ("第一百零二章 权限
+# 问题"). Such a line is a heading even when its number is off (an author's typo, or a new
+# volume restarting at 1 without a volume line), unless it reads like a sentence: the body
+# line "第一章 来暗杀他的人。" must stay body text.
+_TITLED_HEADING = re.compile(rf"^第{_NUM}[章节回][ \t　]+\S")
+_BODY_PUNCT = re.compile(r"[，。；,;]")
 
 _DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}  # fmt: skip
@@ -31,9 +42,12 @@ _UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
 
 
 def parse_number(text: str) -> int | None:
-    """Arabic or Chinese numerals ("12", "十二", "一百零五") -> int."""
+    """Arabic or Chinese numerals ("12", "十二", "一百零五") -> int. Chinese digits
+    written place by place without units ("三六七", "二七零") are read positionally."""
     if text.isdigit():
         return int(text)
+    if len(text) > 1 and all(ch in _DIGITS for ch in text):
+        return int("".join(str(_DIGITS[ch]) for ch in text))
     total, section, digit = 0, 0, None
     for ch in text:
         if ch in _DIGITS:
@@ -113,7 +127,19 @@ class _HeadingTracker:
             ok = short and self.last <= n <= self.last + _MAX_SKIP
         if ok:
             self.last, self.after_volume = n, False
-        return ok
+            return True
+
+        if not (short and _TITLED_HEADING.match(line) and not _BODY_PUNCT.search(line)):
+            return False
+        # Out of sequence, but clearly a heading. 1 restarts the numbering (a new volume);
+        # a smaller number is a typo ("第一八十三章" after 182), so the sequence carries on
+        # as if it were the next one; a larger one is a real jump.
+        if n == 1 or n > self.last:
+            self.last = n
+        else:
+            self.last += 1
+        self.after_volume = False
+        return True
 
 
 def split_chapters(text: str) -> SplitResult:
@@ -126,12 +152,22 @@ def split_chapters(text: str) -> SplitResult:
     warnings: list[str] = []
     tracker = _HeadingTracker()
 
+    volume: int | None = None
     for line in lines:
         stripped = line.strip()
-        if _is_volume_heading(stripped):
+        prefixed = _VOLUME_PREFIXED.match(stripped)
+        if prefixed:
+            # Judge the chapter part; a change of volume may restart the numbering.
+            if parse_number(prefixed.group(1)) != volume:
+                volume = parse_number(prefixed.group(1))
+                tracker.volume()
+            is_heading = tracker.accept(prefixed.group(2))
+        elif _is_volume_heading(stripped):
             tracker.volume()
             continue
-        if tracker.accept(stripped):
+        else:
+            is_heading = tracker.accept(stripped)
+        if is_heading:
             chapters.append((stripped, []))
         elif chapters:
             chapters[-1][1].append(line)

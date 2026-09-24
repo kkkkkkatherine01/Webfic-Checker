@@ -1,0 +1,20 @@
+# Step 1 only needs Postgres. redis / qdrant / api / worker / web are added in later steps.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: webfic
+      POSTGRES_PASSWORD: webfic
+      POSTGRES_DB: webfic
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webfic"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

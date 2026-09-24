@@ -1,0 +1,45 @@
+# Design docs stay local only (not pushed to GitHub)
+spec.md
+spec.v*.md
+docs/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Local data / model caches
+data/
+models/
+eval/runs/
+eval/.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Real novels for qualitative testing: never commit (copyright / private content)
+eval/private/
+
+# Golden set and baselines stay local (story05 is the user's own writing; baselines quote
+# the stories). Tests that need them skip when eval/golden/ is absent.
+eval/golden/
+eval/baseline*.json
+# Downloaded evaluation corpora (WebNovelBench, 蜀山剑侠传, DetectiveQA)
+eval/external/

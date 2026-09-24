@@ -1,0 +1,154 @@
+"""SQLAlchemy models. Every business table carries `user_id`; book-scoped tables also
+carry `book_id`. `user_id` has no foreign key until the users table exists (before launch)."""
+
+import uuid
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+JsonType = JSON().with_variant(JSONB(), "postgresql")
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class _Common:
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Book(_Common, Base):
+    __tablename__ = "books"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    title: Mapped[str] = mapped_column(Text)
+
+
+class Chapter(_Common, Base):
+    __tablename__ = "chapters"
+    __table_args__ = (UniqueConstraint("book_id", "number"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    number: Mapped[int]
+    title: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text)
+    char_count: Mapped[int]
+    content_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class Character(_Common, Base):
+    __tablename__ = "characters"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    canonical_name: Mapped[str] = mapped_column(Text)
+
+
+class CharacterAlias(_Common, Base):
+    __tablename__ = "character_aliases"
+    __table_args__ = (UniqueConstraint("book_id", "alias"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    character_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+    alias: Mapped[str] = mapped_column(Text)
+    first_chapter: Mapped[int]
+    source: Mapped[str] = mapped_column(String(16), default="extracted")
+
+
+class _ChapterFact(_Common):
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    # Indexed: re-extracting a chapter deletes its facts by chapter.
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), index=True
+    )
+    chapter_number: Mapped[int]
+    raw_text: Mapped[str] = mapped_column(Text)
+    is_flashback: Mapped[bool] = mapped_column(default=False)
+    char_start: Mapped[int]
+    char_end: Mapped[int]
+
+
+class AgeFactRow(_ChapterFact, Base):
+    __tablename__ = "age_facts"
+
+    character_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+    mention: Mapped[str] = mapped_column(Text)
+    statement_type: Mapped[str] = mapped_column(String(16))
+    value: Mapped[float | None]
+    life_stage: Mapped[str | None] = mapped_column(String(16))
+    years_before_present: Mapped[float | None]
+    value_max: Mapped[float | None]
+    is_speculative: Mapped[bool] = mapped_column(default=False)
+    years_before_present_quote: Mapped[str | None] = mapped_column(Text)
+
+
+class ElapsedTimeFactRow(_ChapterFact, Base):
+    __tablename__ = "elapsed_time_facts"
+
+    estimated_years: Mapped[float | None]
+    kind: Mapped[str] = mapped_column(String(16), default="advance")
+
+
+class IssueRow(_Common, Base):
+    __tablename__ = "consistency_issues"
+    __table_args__ = (UniqueConstraint("book_id", "fingerprint"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    checker: Mapped[str] = mapped_column(String(32))
+    issue_type: Mapped[str] = mapped_column(String(64))
+    confidence: Mapped[str] = mapped_column(String(24))
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    description: Mapped[str] = mapped_column(Text)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JsonType)
+    subjects: Mapped[list[str]] = mapped_column(JsonType, default=list)  # character ids
+    fingerprint: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LLMCallRow(_Common, Base):
+    """One row per LLM request: the usage ledger and the response cache."""
+
+    __tablename__ = "llm_calls"
+    __table_args__ = (Index("ix_llm_calls_request_hash_ok", "request_hash", "ok"),)
+
+    user_id: Mapped[uuid.UUID | None] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID | None] = mapped_column(index=True)
+    purpose: Mapped[str] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(64))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    response_text: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    cached_input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))
+    latency_ms: Mapped[int] = mapped_column(default=0)
+    cache_hit: Mapped[bool] = mapped_column(default=False)
+    ok: Mapped[bool] = mapped_column(default=False)

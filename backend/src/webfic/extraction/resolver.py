@@ -66,6 +66,7 @@ class NewAlias:
 class Rename:
     character_id: uuid.UUID
     new_name: str
+    old_name: str  # kept so the rename can be undone
 
 
 @dataclass
@@ -74,6 +75,7 @@ class Merge:
 
     from_id: uuid.UUID
     into_id: uuid.UUID
+    from_name: str  # kept so the merge can be undone
 
 
 class CharacterIndex:
@@ -92,6 +94,9 @@ class CharacterIndex:
         self.new_aliases: list[NewAlias] = []
         self.renames: list[Rename] = []
         self.merges: list[Merge] = []
+
+    def characters(self) -> list[KnownCharacter]:
+        return list(self._by_id.values())
 
     def name_of(self, character_id: uuid.UUID) -> str:
         return self._by_id[character_id].canonical_name
@@ -148,7 +153,7 @@ class CharacterIndex:
         old_name = character.canonical_name
         character.canonical_name = real_name
         self._by_name[real_name] = target
-        self.renames.append(Rename(target, real_name))
+        self.renames.append(Rename(target, real_name, old_name))
         # The real name is canonical now; a pending alias row for it would be redundant.
         self.new_aliases = [
             a for a in self.new_aliases if not (a.character_id == target and a.alias == real_name)
@@ -172,7 +177,7 @@ class CharacterIndex:
         ]
         self.new_aliases.append(NewAlias(into, source.canonical_name))
         if persisted:
-            self.merges.append(Merge(from_id, into))
+            self.merges.append(Merge(from_id, into, source.canonical_name))
 
     def _create(self, name: str) -> uuid.UUID:
         character = KnownCharacter(id=uuid.uuid4(), canonical_name=name)

@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
+from typing import Any
 
 from pydantic import BaseModel
 from sqlalchemy import delete, select, update
@@ -18,6 +19,7 @@ from webfic.db.models import (
     Chapter,
     Character,
     CharacterAlias,
+    CharacterStateRow,
     ElapsedTimeFactRow,
     FactRow,
 )
@@ -26,6 +28,8 @@ from webfic.extraction.resolver import CharacterIndex, KnownCharacter
 from webfic.facts.registry import AGE
 from webfic.ingest.splitter import split_chapters
 from webfic.llm.base import LLMClient, LLMError, ProviderError, ProviderErrorKind
+from webfic.memory import core, events
+from webfic.memory.events import EventKind
 from webfic.services.errors import NotFound
 
 log = logging.getLogger(__name__)
@@ -227,11 +231,17 @@ async def run_import_job(
                     )
                 )  # fmt: skip
 
+            # Every change to the character table is logged, so recomputing from this
+            # chapter can undo it (webfic.memory.events).
+            changes: list[tuple[EventKind, dict[str, Any]]] = []
             for c in index.new_characters:
                 session.add(
                     Character(
                         id=c.id, user_id=user_id, book_id=book_id, canonical_name=c.canonical_name
                     )
+                )
+                changes.append(
+                    (EventKind.CREATE, {"character_id": str(c.id), "name": c.canonical_name})
                 )
             await session.flush()  # characters must exist before rows reference them
             for rename in index.renames:
@@ -240,37 +250,76 @@ async def run_import_job(
                     .where(Character.id == rename.character_id)
                     .values(canonical_name=rename.new_name)
                 )
+                changes.append((EventKind.RENAME, {
+                    "character_id": str(rename.character_id),
+                    "old_name": rename.old_name, "new_name": rename.new_name,
+                }))  # fmt: skip
             for merge in index.merges:
                 log.info(
                     "chapter %s: merging character %s into %s",
                     number, merge.from_id, merge.into_id,
                 )  # fmt: skip
-                for model in (FactRow, CharacterAlias):
+                moved: dict[str, list[str]] = {}
+                for model, key in ((FactRow, "fact_ids"), (CharacterAlias, "alias_ids")):
+                    ids = await session.scalars(
+                        select(model.id).where(model.character_id == merge.from_id)
+                    )
+                    moved[key] = [str(i) for i in ids]
                     await session.execute(
                         update(model)
                         .where(model.character_id == merge.from_id)
                         .values(character_id=merge.into_id)
                     )
+                await session.execute(
+                    delete(CharacterStateRow).where(CharacterStateRow.character_id == merge.from_id)
+                )
                 await session.execute(delete(Character).where(Character.id == merge.from_id))
+                changes.append((EventKind.MERGE, {
+                    "from_id": str(merge.from_id), "from_name": merge.from_name,
+                    "into_id": str(merge.into_id), **moved,
+                }))  # fmt: skip
             for a in index.new_aliases:
+                alias_id = uuid.uuid4()
                 session.add(
                     CharacterAlias(
-                        user_id=user_id, book_id=book_id, character_id=a.character_id,
+                        id=alias_id, user_id=user_id, book_id=book_id, character_id=a.character_id,
                         alias=a.alias, first_chapter=number, source="extracted",
                     )
                 )  # fmt: skip
+                changes.append((EventKind.ALIAS, {
+                    "alias_id": str(alias_id), "character_id": str(a.character_id),
+                    "alias": a.alias,
+                }))  # fmt: skip
             session.add_all(fact_rows)
-            for located in extraction.elapsed:
-                e = located.statement
-                session.add(
-                    ElapsedTimeFactRow(
-                        user_id=user_id, book_id=book_id, chapter_id=chapter_id,
-                        chapter_number=number, raw_text=e.raw_text,
-                        estimated_years=e.estimated_years, kind=e.kind,
-                        is_flashback=e.is_flashback,
-                        char_start=located.char_start, char_end=located.char_end,
-                    )
-                )  # fmt: skip
+            span_rows = [
+                ElapsedTimeFactRow(
+                    user_id=user_id, book_id=book_id, chapter_id=chapter_id,
+                    chapter_number=number, raw_text=located.statement.raw_text,
+                    estimated_years=located.statement.estimated_years,
+                    kind=located.statement.kind, is_flashback=located.statement.is_flashback,
+                    char_start=located.char_start, char_end=located.char_end,
+                )
+                for located in extraction.elapsed
+            ]  # fmt: skip
+            session.add_all(span_rows)
+            await session.flush()
+            await events.record(
+                session, user_id=user_id, book_id=book_id, chapter_id=chapter_id,
+                chapter_number=number, events=changes,
+            )  # fmt: skip
+
+            # Core: the state after this chapter, from the state after the previous one.
+            previous = await core.load_state(
+                session, user_id=user_id, book_id=book_id, before_chapter=number
+            )
+            state = core.advance(
+                previous, chapter_number=number, facts=fact_rows, spans=span_rows,
+                characters=index.characters(),
+                merges=[(m.from_id, m.into_id) for m in index.merges],
+            )  # fmt: skip
+            await core.save_state(
+                session, user_id=user_id, book_id=book_id, chapter_id=chapter_id, state=state
+            )
 
             chapter.status, chapter.error = "extracted", None
             await session.commit()

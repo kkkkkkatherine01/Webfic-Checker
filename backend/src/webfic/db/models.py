@@ -76,6 +76,59 @@ class CharacterAlias(_Common, Base):
     source: Mapped[str] = mapped_column(String(16), default="extracted")
 
 
+class CharacterEvent(_Common, Base):
+    """Change log of the character table: every character created, alias added, rename
+    and merge made while extracting a chapter. Recomputing from chapter N undoes the
+    events of chapters N.. in reverse `seq` order (see webfic.memory.events)."""
+
+    __tablename__ = "character_events"
+    __table_args__ = (UniqueConstraint("book_id", "seq"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    seq: Mapped[int]  # order within the book
+    chapter_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), index=True
+    )
+    chapter_number: Mapped[int | None]  # None for the author's own edits (before launch)
+    source: Mapped[str] = mapped_column(String(16), default="extracted")  # extracted / user
+    kind: Mapped[str] = mapped_column(String(16))  # create / alias / rename / merge
+    payload: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
+class CharacterStateRow(_Common, Base):
+    """Core layer: the latest known state of each character (a `CharacterState`)."""
+
+    __tablename__ = "character_states"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("characters.id", ondelete="CASCADE"), unique=True
+    )
+    chapter_number: Mapped[int]  # the state is as of the end of this chapter
+    state: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
+class CoreSnapshot(_Common, Base):
+    """The whole book's Core state (a `BookState`) at the end of one chapter, for rolling
+    back when a chapter changes and for "what was known by chapter N" queries."""
+
+    __tablename__ = "core_snapshots"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), unique=True
+    )
+    chapter_number: Mapped[int]
+    state: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
 class _ChapterFact(_Common):
     user_id: Mapped[uuid.UUID] = mapped_column(index=True)
     book_id: Mapped[uuid.UUID] = mapped_column(

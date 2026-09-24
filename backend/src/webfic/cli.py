@@ -19,6 +19,7 @@ from webfic.db.session import make_engine, make_session_factory
 from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
+from webfic.memory import core
 from webfic.services import checks, imports, reports
 from webfic.services.errors import NotFound
 
@@ -209,6 +210,49 @@ def report(
             for e in issue.evidence:
                 console.print(f"     [dim]第 {e.chapter_number} 章[/] 「{e.quote}」")
             console.print()
+
+    _run(main)
+
+
+def _fmt_age(low: float | None, high: float | None) -> str:
+    if low is None:
+        return "—"
+    low, high = round(low, 1), round(high if high is not None else low, 1)  # months add decimals
+    text = f"{low:g}" if high == low else f"{low:g}–{high:g}"
+    return f"{text} 岁"
+
+
+@app.command()
+def character(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    name: Annotated[str, typer.Argument(help="角色名或别名")],
+    chapter: Annotated[int | None, typer.Option(help="查看截至第几章的状态")] = None,
+) -> None:
+    """查看角色当前状态（年龄、人生阶段、别名）。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        async with factory() as session:
+            view = await core.get_character(
+                session, user_id=settings.dev_user_id, book_id=book_id, name=name,
+                as_of_chapter=chapter,
+            )  # fmt: skip
+        console.print(f"[bold]{view.canonical_name}[/]（截至第 {view.as_of_chapter} 章）")
+        console.print(f"  别名：{'、'.join(view.aliases) or '—'}")
+        if view.age_low is not None:
+            console.print(
+                f"  最近写明的年龄：{_fmt_age(view.age_low, view.age_high)}"
+                f"（第 {view.age_chapter} 章「{view.age_quote}」）"
+            )
+            estimate = _fmt_age(view.estimated_age_low, view.estimated_age_high)
+            note = (
+                "" if view.estimated_age_low is not None else "（中间有无法量化的时间跳跃，不推算）"
+            )
+            console.print(f"  推算此时：{estimate}{note}")
+        else:
+            console.print("  年龄：原文没有写明")
+        if view.life_stage is not None:
+            console.print(f"  人生阶段：{view.life_stage}（第 {view.life_stage_chapter} 章）")
 
     _run(main)
 

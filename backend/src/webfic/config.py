@@ -1,5 +1,6 @@
 import uuid
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import SecretStr
@@ -35,6 +36,14 @@ class Settings(BaseSettings):
 
     chunk_size: int = 8000
     chunk_overlap: int = 500
+
+    # Passage search (Archival layer): small passages, unrelated to extraction chunks.
+    passage_size: int = 300
+    passage_overlap: int = 60
+    embed_model: str = "BAAI/bge-small-zh-v1.5"
+    # Where the embedding model and the jieba dictionary cache live (fastembed/ and jieba/
+    # under it). None leaves the libraries' defaults, which are on the system drive.
+    model_cache_dir: Path | None = None
 
 
 @lru_cache

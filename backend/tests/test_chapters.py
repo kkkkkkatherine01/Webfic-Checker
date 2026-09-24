@@ -54,8 +54,9 @@ def respond(messages):
 class World:
     """One book imported with the fake model; `llm` shares one response cache."""
 
-    def __init__(self, factory):
+    def __init__(self, factory, archival=None):
         self.factory = factory
+        self.archival = archival  # also index passages for search
         self.backend = FakeBackend(respond)
         tiers = {Tier.EXTRACT: TierConfig("deepseek-flash"), Tier.REASON: TierConfig("x")}
         self.llm = JsonLLMClient(self.backend, tiers, store=MemoryCallStore())
@@ -66,13 +67,16 @@ class World:
             job = await imports.create_import_job(session, user_id=USER, title="t", text=text)
         self.book_id = job.book_id
         await imports.run_import_job(
-            self.factory, self.llm, Settings(), user_id=USER, book_id=self.book_id
-        )
+            self.factory, self.llm, Settings(), user_id=USER, book_id=self.book_id,
+            archival=self.archival,
+        )  # fmt: skip
         async with self.factory() as session:
             await checks.run_checks(session, user_id=USER, book_id=self.book_id)
         return self
 
     async def do(self, operation, **kwargs):
+        if self.archival is not None:
+            kwargs.setdefault("archival", self.archival)
         return await operation(
             self.factory, self.llm, Settings(), user_id=USER, book_id=self.book_id, **kwargs
         )

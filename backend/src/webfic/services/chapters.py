@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from webfic.archival.index import Archival
 from webfic.checkers.types import IssueStatus
 from webfic.config import Settings
 from webfic.db.models import (
@@ -30,6 +31,7 @@ from webfic.db.models import (
     ElapsedTimeFactRow,
     FactRow,
     IssueRow,
+    PassageRow,
 )
 from webfic.db.session import rolled_back
 from webfic.ingest.splitter import normalize_newlines, split_chapters
@@ -135,6 +137,7 @@ async def _apply(
     book_id: uuid.UUID,
     edit: Edit,
     dry_run: bool,
+    archival: Archival | None,
 ) -> ChangeResult:
     """Run `edit`, extract what it left pending, re-check the book and report the issues
     that appeared or disappeared; roll it all back for a dry run."""
@@ -147,7 +150,7 @@ async def _apply(
             await session.commit()
 
         extraction = await imports.run_import_job(
-            scoped, llm, settings, user_id=user_id, book_id=book_id
+            scoped, llm, settings, user_id=user_id, book_id=book_id, archival=archival
         )
         async with scoped() as session:
             await checks.run_checks(session, user_id=user_id, book_id=book_id)
@@ -187,6 +190,7 @@ async def append_chapters(
     book_id: uuid.UUID,
     text: str,
     dry_run: bool = False,
+    archival: Archival | None = None,
 ) -> ChangeResult:
     """Add one or more chapters (split like an import) after the last one."""
 
@@ -207,7 +211,14 @@ async def append_chapters(
         return split.warnings
 
     return await _apply(
-        factory, llm, settings, user_id=user_id, book_id=book_id, edit=edit, dry_run=dry_run
+        factory,
+        llm,
+        settings,
+        user_id=user_id,
+        book_id=book_id,
+        edit=edit,
+        dry_run=dry_run,
+        archival=archival,
     )
 
 
@@ -221,6 +232,7 @@ async def replace_chapter(
     number: int,
     content: str,
     dry_run: bool = False,
+    archival: Archival | None = None,
 ) -> ChangeResult:
     """Replace chapter `number`'s text and recompute from it."""
     content = normalize_newlines(content).strip("\n")
@@ -235,7 +247,14 @@ async def replace_chapter(
         return []
 
     return await _apply(
-        factory, llm, settings, user_id=user_id, book_id=book_id, edit=edit, dry_run=dry_run
+        factory,
+        llm,
+        settings,
+        user_id=user_id,
+        book_id=book_id,
+        edit=edit,
+        dry_run=dry_run,
+        archival=archival,
     )
 
 
@@ -248,6 +267,7 @@ async def delete_chapter(
     book_id: uuid.UUID,
     number: int,
     dry_run: bool = False,
+    archival: Archival | None = None,
 ) -> ChangeResult:
     """Delete chapter `number`; later chapters move up one number and are recomputed."""
 
@@ -255,9 +275,8 @@ async def delete_chapter(
         chapter = await _chapter(session, user_id, book_id, number)
         # Undo first: the chapter's change log goes with the chapter row.
         await _reset_from(session, user_id, book_id, number)
-        await session.execute(
-            delete(ChapterExtractionRow).where(ChapterExtractionRow.chapter_id == chapter.id)
-        )
+        for model in (ChapterExtractionRow, PassageRow):
+            await session.execute(delete(model).where(model.chapter_id == chapter.id))
         await session.delete(chapter)
         await session.flush()
         later = (Chapter.user_id == user_id, Chapter.book_id == book_id, Chapter.number > number)
@@ -268,11 +287,28 @@ async def delete_chapter(
             .where(Chapter.user_id == user_id, Chapter.book_id == book_id, Chapter.number < 0)
             .values(number=-Chapter.number - 1)
         )
+        # Passages keep their text; only their chapter numbers follow the move.
+        await session.execute(
+            update(PassageRow)
+            .where(PassageRow.user_id == user_id, PassageRow.book_id == book_id)
+            .values(
+                chapter_number=select(Chapter.number)
+                .where(Chapter.id == PassageRow.chapter_id)
+                .scalar_subquery()
+            )
+        )
         await _mark_pending(session, user_id, book_id, number)
         return []
 
     return await _apply(
-        factory, llm, settings, user_id=user_id, book_id=book_id, edit=edit, dry_run=dry_run
+        factory,
+        llm,
+        settings,
+        user_id=user_id,
+        book_id=book_id,
+        edit=edit,
+        dry_run=dry_run,
+        archival=archival,
     )
 
 
@@ -287,6 +323,7 @@ async def patch_chapter(
     old: str,
     new: str,
     dry_run: bool = False,
+    archival: Archival | None = None,
 ) -> ChangeResult:
     """Replace one passage of chapter `number`; `old` must occur exactly once. This is
     the form revisions proposed by an agent take."""
@@ -301,5 +338,5 @@ async def patch_chapter(
         raise InvalidEdit(f"第 {number} 章里{where}：「{old}」")
     return await replace_chapter(
         factory, llm, settings, user_id=user_id, book_id=book_id, number=number,
-        content=content.replace(old, new), dry_run=dry_run,
+        content=content.replace(old, new), dry_run=dry_run, archival=archival,
     )  # fmt: skip

@@ -1,7 +1,8 @@
-# Step 1 only needs Postgres. redis / qdrant / api / worker / web are added in later steps.
+# Development needs only Postgres (with pgvector for passage search). redis / api /
+# worker / web come before launch.
 services:
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16  # Postgres 16 plus the pgvector extension
     environment:
       POSTGRES_USER: webfic
       POSTGRES_PASSWORD: webfic

@@ -13,13 +13,14 @@ from rich.table import Table
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from webfic.archival.index import platform_archival, reindex_book
 from webfic.checkers.types import Confidence
 from webfic.config import Settings, get_settings
 from webfic.db.session import make_engine, make_session_factory
 from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
-from webfic.memory import core
+from webfic.memory import archival, core
 from webfic.services import chapters, checks, imports, reports
 from webfic.services.errors import InvalidEdit, NotFound
 
@@ -100,8 +101,9 @@ async def _extract(settings: Settings, factory: Factory, book_id: uuid.UUID) -> 
                 progress.console.print(f"[red]✗ {event.chapter_title} 失败：{event.error}[/]")
 
         result = await imports.run_import_job(
-            factory, llm, settings, user_id=user_id, book_id=book_id, on_progress=on_progress
-        )
+            factory, llm, settings, user_id=user_id, book_id=book_id, on_progress=on_progress,
+            archival=platform_archival(settings),
+        )  # fmt: skip
 
     console.print(
         f"抽取完成：成功 {result.extracted} 章，失败 {result.failed} 章"
@@ -254,8 +256,9 @@ def _change(book: str, operation: Callable[..., Awaitable[chapters.ChangeResult]
         llm = platform_client(settings, DbCallStore(factory, user_id=user_id, book_id=book_id))
         with console.status("处理中（原文未改的章节复用上次的抽取结果）…"):
             result = await operation(
-                factory, llm, settings, user_id=user_id, book_id=book_id, **kwargs
-            )
+                factory, llm, settings, user_id=user_id, book_id=book_id,
+                archival=platform_archival(settings), **kwargs,
+            )  # fmt: skip
         _print_change(result)
 
     _run(main)
@@ -345,6 +348,101 @@ def character(
             console.print("  年龄：原文没有写明")
         if view.life_stage is not None:
             console.print(f"  人生阶段：{view.life_stage}（第 {view.life_stage_chapter} 章）")
+
+    _run(main)
+
+
+# --- text search (Archival) -----------------------------------------------------------
+
+
+def _chapter_range(text: str | None) -> tuple[int, int] | None:
+    if text is None:
+        return None
+    first, _, last = text.partition("-")
+    try:
+        return int(first), int(last or first)
+    except ValueError as exc:
+        raise typer.BadParameter(f"章节范围应写成 5 或 3-9：{text}") from exc
+
+
+@app.command()
+def search(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    query: Annotated[str, typer.Argument(help="要找的内容，如「林远的年龄」")],
+    character: Annotated[
+        str | None, typer.Option(help="只看提到这个角色（名字或别名）的段落")
+    ] = None,
+    chapters: Annotated[str | None, typer.Option(help="章节范围，如 3-9")] = None,
+    k: Annotated[int, typer.Option("-k", help="返回几段")] = 5,
+    mode: Annotated[str, typer.Option(help="hybrid / vector / keyword")] = "hybrid",
+) -> None:
+    """在原文中检索段落（向量 + 关键词）。"""
+    if mode not in ("hybrid", "vector", "keyword"):
+        raise typer.BadParameter("mode 只能是 hybrid、vector 或 keyword")
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        async with factory() as session:
+            hits = await archival.search_text(
+                session, platform_archival(settings), user_id=settings.dev_user_id,
+                book_id=book_id, query=query, k=k, character=character,
+                chapters=_chapter_range(chapters), mode=mode,  # type: ignore[arg-type]
+            )  # fmt: skip
+        if not hits:
+            console.print("没有找到相关段落（这部作品可能还没建检索索引：webfic reindex）。")
+        for n, hit in enumerate(hits, start=1):
+            via = "+".join({"vector": "向量", "keyword": "关键词"}[m] for m in hit.matched_by)
+            console.print(
+                f"{n}. [dim]第 {hit.chapter_number} 章 {hit.char_start}–{hit.char_end}"
+                f"（{via}）[/]\n   {hit.text.replace(chr(10), ' ')}"
+            )
+
+    _run(main)
+
+
+@app.command()
+def passage(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    chapter: Annotated[int, typer.Argument(help="章号")],
+    start: Annotated[int, typer.Argument(help="起始位置（章内字符偏移）")],
+    end: Annotated[int, typer.Argument(help="结束位置")],
+    context: Annotated[int, typer.Option(help="前后各多读多少字")] = 200,
+) -> None:
+    """读取原文某个位置及其上下文。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        async with factory() as session:
+            shown = await archival.read_passage(
+                session, user_id=settings.dev_user_id, book_id=book_id, chapter=chapter,
+                start=start, end=end, context=context,
+            )  # fmt: skip
+        t = shown.text
+        console.print(f"[dim]{shown.chapter_title}（{shown.char_start}–{shown.char_end}）[/]")
+        console.print(
+            t[: shown.focus_start]
+            + f"[bold reverse]{t[shown.focus_start : shown.focus_end]}[/]"
+            + t[shown.focus_end :],
+            markup=True,
+        )
+
+    _run(main)
+
+
+@app.command()
+def reindex(book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")]) -> None:
+    """为作品建立或更新原文检索索引（本地计算，不花钱；原文没变的章节跳过）。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        with console.status("建立检索索引（第一次会下载向量模型，约 95MB）…"):
+            result = await reindex_book(
+                factory, platform_archival(settings), user_id=settings.dev_user_id, book_id=book_id
+            )
+        console.print(
+            f"共 {result.chapters} 章，重建 {result.rebuilt} 章、{result.passages} 段，"
+            f"耗时 {result.seconds} 秒。"
+        )
 
     _run(main)
 

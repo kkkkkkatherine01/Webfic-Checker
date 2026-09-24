@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from webfic.archival.index import Archival, index_chapter
 from webfic.config import Settings
 from webfic.db.models import (
     Book,
@@ -154,9 +155,11 @@ async def run_import_job(
     user_id: uuid.UUID,
     book_id: uuid.UUID,
     on_progress: ProgressCallback | None = None,
+    archival: Archival | None = None,
 ) -> ImportJobResult:
     """Extract every chapter that is not yet `extracted`, in narrative order. Each chapter
-    commits on its own, so an interrupted run can simply be started again."""
+    commits on its own, so an interrupted run can simply be started again. With
+    `archival`, each chapter's passages are indexed for search in the same transaction."""
     async with session_factory() as session:
         book = await session.scalar(select(Book).where(Book.id == book_id, Book.user_id == user_id))
         if book is None:
@@ -352,6 +355,12 @@ async def run_import_job(
             await core.save_state(
                 session, user_id=user_id, book_id=book_id, chapter_id=chapter_id, state=state
             )
+            if archival is not None:
+                names = [n for c in index.characters() for n in (c.canonical_name, *c.aliases)]
+                await index_chapter(
+                    session, archival, user_id=user_id, book_id=book_id, chapter=chapter,
+                    names=names,
+                )  # fmt: skip
 
             chapter.status, chapter.error = "extracted", None
             await session.commit()

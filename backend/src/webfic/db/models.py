@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     DateTime,
@@ -147,6 +148,34 @@ class ChapterExtractionRow(_Common, Base):
     content_hash: Mapped[str] = mapped_column(String(64))  # of the chapter text read
     version: Mapped[str] = mapped_column(String(32))  # prompt and chunking used
     result: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
+EMBEDDING_DIM = 512  # BAAI/bge-small-zh-v1.5
+
+
+class PassageRow(_Common, Base):
+    """Archival layer: a short passage of a chapter's text (about 300 characters, cut at
+    sentence ends, overlapping its neighbours), with its embedding and its jieba tokens
+    for keyword search. Passages depend only on their chapter's text."""
+
+    __tablename__ = "passages"
+    __table_args__ = (Index("ix_passages_book_chapter", "book_id", "chapter_number"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), index=True
+    )
+    chapter_number: Mapped[int]
+    # Chapter text + passage size/overlap + embedding model: passages are rebuilt only
+    # when one of these changes.
+    source_key: Mapped[str] = mapped_column(String(64))
+    char_start: Mapped[int]
+    char_end: Mapped[int]
+    text: Mapped[str] = mapped_column(Text)
+    tokens: Mapped[str] = mapped_column(Text)  # space-separated jieba tokens
+    # pgvector on Postgres; plain JSON on SQLite, where unit tests search in Python.
+    embedding: Mapped[Any] = mapped_column(JSON().with_variant(Vector(EMBEDDING_DIM), "postgresql"))
 
 
 class _ChapterFact(_Common):

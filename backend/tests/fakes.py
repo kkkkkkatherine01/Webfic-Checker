@@ -43,3 +43,38 @@ class MemoryCallStore:
 
     async def record(self, record: CallRecord) -> None:
         self.records.append(record)
+
+
+class HashEmbedder:
+    """Deterministic stand-in for the embedding model: hashed character bigrams. Texts
+    that share wording get similar vectors; nothing is downloaded."""
+
+    dim = 512
+
+    def _vector(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        from itertools import pairwise
+
+        vector = [0.0] * self.dim
+        for a, b in pairwise(text):
+            bucket = int(hashlib.md5((a + b).encode()).hexdigest()[:8], 16) % self.dim
+            vector[bucket] += 1.0
+        norm = math.sqrt(sum(x * x for x in vector)) or 1.0
+        return [x / norm for x in vector]
+
+    def embed_passages(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(t) for t in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._vector(text)
+
+
+def make_archival(tmp_path, size: int = 300, overlap: int = 60):
+    from webfic.archival.index import Archival
+    from webfic.archival.tokenize import Tokenizer
+
+    return Archival(
+        embedder=HashEmbedder(), tokenizer=Tokenizer(tmp_path), embed_model="hash",
+        passage_size=size, passage_overlap=overlap,
+    )  # fmt: skip

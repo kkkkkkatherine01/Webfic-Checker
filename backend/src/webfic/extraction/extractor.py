@@ -1,11 +1,13 @@
 """Run age extraction over one chapter: chunk, call the LLM, locate every statement in
 the source text, and merge the results of overlapping chunks."""
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 from importlib import resources
+from typing import Any
 
 from webfic.extraction.locator import locate
 from webfic.extraction.schemas import (
@@ -53,6 +55,55 @@ class ChapterExtraction:
     cost_usd: Decimal = Decimal(0)
     llm_calls: int = 0
     cache_hits: int = 0
+
+
+def extraction_version(system_prompt: str, chunk_size: int, chunk_overlap: int) -> str:
+    """Identifies everything besides the chapter text that shapes an extraction; a stored
+    extraction is only reused while this stays the same."""
+    key = f"{AGE_SCHEMA_VERSION}|{chunk_size}|{chunk_overlap}|{system_prompt}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+def dump_extraction(extraction: ChapterExtraction) -> dict[str, Any]:
+    """The reusable part of an extraction (not its cost), as JSON."""
+    return {
+        "ages": [
+            {
+                "statement": a.statement.model_dump(mode="json"),
+                "start": a.char_start,
+                "end": a.char_end,
+            }
+            for a in extraction.ages
+        ],
+        "elapsed": [
+            {
+                "statement": e.statement.model_dump(mode="json"),
+                "start": e.char_start,
+                "end": e.char_end,
+            }
+            for e in extraction.elapsed
+        ],
+        "revealed_names": [r.model_dump(mode="json") for r in extraction.revealed_names],
+        "dropped": list(extraction.dropped),
+    }
+
+
+def load_extraction(data: dict[str, Any]) -> ChapterExtraction:
+    """A stored extraction; it made no model calls this time."""
+    return ChapterExtraction(
+        ages=[
+            LocatedAge(AgeStatement.model_validate(a["statement"]), a["start"], a["end"])
+            for a in data["ages"]
+        ],
+        elapsed=[
+            LocatedElapsed(
+                ElapsedTimeStatement.model_validate(e["statement"]), e["start"], e["end"]
+            )
+            for e in data["elapsed"]
+        ],
+        revealed_names=[RevealedName.model_validate(r) for r in data["revealed_names"]],
+        dropped=list(data["dropped"]),
+    )
 
 
 def build_user_message(

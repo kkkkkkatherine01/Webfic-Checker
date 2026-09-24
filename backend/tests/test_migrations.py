@@ -70,13 +70,13 @@ def test_0006_moves_age_facts_into_facts_and_back(tmp_path):
     assert rows(db, "SELECT id, value_num FROM facts") == [(FACT, 30)]
 
 
-def test_0007_core_tables_come_and_go(tmp_path):
+def test_tables_added_after_0006_come_and_go(tmp_path):
     db = tmp_path / "m.db"
     tables = "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN"
-    names = "('character_events', 'character_states', 'core_snapshots')"
+    names = "('character_events', 'character_states', 'core_snapshots', 'chapter_extractions')"
     alembic(db, "upgrade", "head")
-    assert len(rows(db, f"{tables} {names}")) == 3
+    assert len(rows(db, f"{tables} {names}")) == 4
     alembic(db, "downgrade", "0006")
     assert rows(db, f"{tables} {names}") == []
     alembic(db, "upgrade", "head")
-    assert len(rows(db, f"{tables} {names}")) == 3
+    assert len(rows(db, f"{tables} {names}")) == 4

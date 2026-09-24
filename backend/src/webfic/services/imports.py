@@ -17,13 +17,20 @@ from webfic.config import Settings
 from webfic.db.models import (
     Book,
     Chapter,
+    ChapterExtractionRow,
     Character,
     CharacterAlias,
     CharacterStateRow,
     ElapsedTimeFactRow,
     FactRow,
 )
-from webfic.extraction.extractor import extract_chapter, load_prompt
+from webfic.extraction.extractor import (
+    dump_extraction,
+    extract_chapter,
+    extraction_version,
+    load_extraction,
+    load_prompt,
+)
 from webfic.extraction.resolver import CharacterIndex, KnownCharacter
 from webfic.facts.registry import AGE
 from webfic.ingest.splitter import split_chapters
@@ -64,6 +71,7 @@ class ImportJobResult(BaseModel):
     dropped_statements: int
     llm_calls: int
     cache_hits: int
+    reused: int = 0  # chapters whose stored extraction was reused (no model call)
     input_tokens: int
     output_tokens: int
     cost_usd: Decimal
@@ -166,6 +174,7 @@ async def run_import_job(
         ).all()
 
     system_prompt = load_prompt()
+    version = extraction_version(system_prompt, settings.chunk_size, settings.chunk_overlap)
     result = ImportJobResult(
         extracted=0, failed=0, dropped_statements=0, llm_calls=0, cache_hits=0,
         input_tokens=0, output_tokens=0, cost_usd=Decimal(0),
@@ -175,16 +184,39 @@ async def run_import_job(
         async with session_factory() as session:
             chapter = await session.get_one(Chapter, chapter_id)
             index = await _load_character_index(session, user_id, book_id)
+            # An unchanged chapter keeps its earlier reading: asking the model again gives
+            # a slightly different one, which would blur what an edit really changed.
+            stored = await session.scalar(
+                select(ChapterExtractionRow).where(ChapterExtractionRow.chapter_id == chapter_id)
+            )
             try:
-                extraction = await extract_chapter(
-                    llm,
-                    chapter_number=number,
-                    text=chapter.content,
-                    known_characters=index.for_prompt(),
-                    system_prompt=system_prompt,
-                    chunk_size=settings.chunk_size,
-                    chunk_overlap=settings.chunk_overlap,
-                )
+                if (
+                    stored is not None
+                    and stored.content_hash == chapter.content_hash
+                    and stored.version == version
+                ):
+                    extraction = load_extraction(stored.result)
+                    result.reused += 1
+                else:
+                    extraction = await extract_chapter(
+                        llm,
+                        chapter_number=number,
+                        text=chapter.content,
+                        known_characters=index.for_prompt(),
+                        system_prompt=system_prompt,
+                        chunk_size=settings.chunk_size,
+                        chunk_overlap=settings.chunk_overlap,
+                    )
+                    if stored is not None:
+                        await session.delete(stored)
+                        await session.flush()
+                    session.add(
+                        ChapterExtractionRow(
+                            user_id=user_id, book_id=book_id, chapter_id=chapter_id,
+                            content_hash=chapter.content_hash, version=version,
+                            result=dump_extraction(extraction),
+                        )
+                    )  # fmt: skip
             except LLMError as exc:
                 if isinstance(exc, ProviderError) and exc.kind == ProviderErrorKind.AUTH:
                     raise  # a bad or unfunded key fails every chapter; stop here

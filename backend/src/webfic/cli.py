@@ -20,8 +20,8 @@ from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
 from webfic.memory import core
-from webfic.services import checks, imports, reports
-from webfic.services.errors import NotFound
+from webfic.services import chapters, checks, imports, reports
+from webfic.services.errors import InvalidEdit, NotFound
 
 app = typer.Typer(help="网文一致性检查工具", no_args_is_help=True, add_completion=False)
 console = Console()
@@ -47,7 +47,7 @@ def _run[T](fn: Callable[[Settings, Factory], Awaitable[T]]) -> T:
 
     try:
         return asyncio.run(main())
-    except (NotFound, LLMNotConfigured) as exc:
+    except (NotFound, InvalidEdit, LLMNotConfigured) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(1) from exc
     except ProviderError as exc:  # only auth errors reach here; the rest fail per chapter
@@ -212,6 +212,98 @@ def report(
             console.print()
 
     _run(main)
+
+
+# --- chapter management ----------------------------------------------------------------
+
+DryRun = Annotated[bool, typer.Option("--dry-run", help="试算：报告会新增 / 消失的矛盾，不保存")]
+
+
+def _print_issues(title: str, issues: list[reports.IssueView]) -> None:
+    if not issues:
+        return
+    console.print(f"\n[bold]{title}[/]（{len(issues)}）")
+    for issue in issues:
+        console.print(f"  {_CONFIDENCE_LABEL[issue.confidence]}  {issue.description}")
+        for e in issue.evidence:
+            console.print(f"     [dim]第 {e.chapter_number} 章[/] 「{e.quote}」")
+
+
+def _print_change(result: chapters.ChangeResult) -> None:
+    for warning in result.warnings:
+        console.print(f"[yellow]⚠ {warning}[/]")
+    mode = "[bold yellow]试算（未保存）[/]" if result.dry_run else "[bold green]已保存[/]"
+    console.print(
+        f"{mode}：全书 {result.chapters} 章；重算 {result.extracted} 章"
+        f"（其中 {result.reused} 章原文未改、复用上次的抽取结果；失败 {result.failed}），"
+        f"LLM 调用 {result.llm_calls} 次"
+        f"（缓存命中 {result.cache_hits}），费用约 ${result.cost_usd:.4f}"
+    )
+    _print_issues("会新增的矛盾" if result.dry_run else "新增的矛盾", result.issues_added)
+    _print_issues("会消失的矛盾" if result.dry_run else "消失的矛盾", result.issues_removed)
+    if not result.issues_added and not result.issues_removed:
+        console.print("矛盾报告没有变化。")
+
+
+def _change(book: str, operation: Callable[..., Awaitable[chapters.ChangeResult]], **kwargs):
+    """Run a chapter operation with the platform LLM and print what changed."""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        user_id = settings.dev_user_id
+        book_id = await _resolve_book(factory, user_id, book)
+        llm = platform_client(settings, DbCallStore(factory, user_id=user_id, book_id=book_id))
+        with console.status("处理中（原文未改的章节复用上次的抽取结果）…"):
+            result = await operation(
+                factory, llm, settings, user_id=user_id, book_id=book_id, **kwargs
+            )
+        _print_change(result)
+
+    _run(main)
+
+
+@app.command()
+def append(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    file: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="新章节 txt")],
+    dry_run: DryRun = False,
+) -> None:
+    """在作品末尾追加一章或多章。"""
+    _change(book, chapters.append_chapters, text=_read_text(file), dry_run=dry_run)
+
+
+@app.command("replace-chapter")
+def replace_chapter(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    number: Annotated[int, typer.Argument(help="章号（按导入后的顺序，从 1 开始）")],
+    file: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="新正文 txt")],
+    dry_run: DryRun = False,
+) -> None:
+    """用新正文替换第 N 章，并从第 N 章起重算。"""
+    _change(
+        book, chapters.replace_chapter, number=number, content=_read_text(file), dry_run=dry_run
+    )
+
+
+@app.command("delete-chapter")
+def delete_chapter(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    number: Annotated[int, typer.Argument(help="章号")],
+    dry_run: DryRun = False,
+) -> None:
+    """删除第 N 章，后面的章节编号前移并重算。"""
+    _change(book, chapters.delete_chapter, number=number, dry_run=dry_run)
+
+
+@app.command()
+def patch(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    number: Annotated[int, typer.Argument(help="章号")],
+    old: Annotated[str, typer.Argument(help="原片段（在这一章里必须唯一）")],
+    new: Annotated[str, typer.Argument(help="新片段")],
+    dry_run: DryRun = False,
+) -> None:
+    """把第 N 章里的一段原文改成新片段，并从第 N 章起重算。"""
+    _change(book, chapters.patch_chapter, number=number, old=old, new=new, dry_run=dry_run)
 
 
 def _fmt_age(low: float | None, high: float | None) -> str:

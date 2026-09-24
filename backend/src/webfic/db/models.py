@@ -129,6 +129,26 @@ class CoreSnapshot(_Common, Base):
     state: Mapped[dict[str, Any]] = mapped_column(JsonType)
 
 
+class ChapterExtractionRow(_Common, Base):
+    """What the model extracted from one chapter (all chunks merged, quotes located),
+    kept so that recomputing reuses it while the chapter text and the extraction setup
+    are unchanged. Asking the model again would give a slightly different reading and
+    blur what an edit really changed."""
+
+    __tablename__ = "chapter_extractions"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), unique=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64))  # of the chapter text read
+    version: Mapped[str] = mapped_column(String(32))  # prompt and chunking used
+    result: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
 class _ChapterFact(_Common):
     user_id: Mapped[uuid.UUID] = mapped_column(index=True)
     book_id: Mapped[uuid.UUID] = mapped_column(

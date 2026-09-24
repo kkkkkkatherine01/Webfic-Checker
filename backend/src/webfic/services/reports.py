@@ -59,6 +59,30 @@ class UsageSummary(BaseModel):
 _CONFIDENCE_ORDER = {c: i for i, c in enumerate(Confidence)}
 
 
+def issue_view(row: IssueRow) -> IssueView:
+    return IssueView(
+        id=row.id,
+        checker=row.checker,
+        issue_type=row.issue_type,
+        confidence=Confidence(row.confidence),
+        status=IssueStatus(row.status),
+        description=row.description,
+        evidence=[Evidence.model_validate(e) for e in row.evidence],
+        subjects=row.subjects or [],
+    )
+
+
+def sort_issues(issues: list[IssueView]) -> list[IssueView]:
+    """Most certain first, then in narrative order."""
+    return sorted(
+        issues,
+        key=lambda i: (
+            _CONFIDENCE_ORDER[i.confidence],
+            min((e.chapter_number for e in i.evidence), default=0),
+        ),
+    )
+
+
 async def list_books(session: AsyncSession, *, user_id: uuid.UUID) -> list[BookSummary]:
     chapter_stats = (
         select(
@@ -118,25 +142,7 @@ async def get_report(
     query = select(IssueRow).where(IssueRow.user_id == user_id, IssueRow.book_id == book_id)
     if not include_closed:
         query = query.where(IssueRow.status.in_([IssueStatus.OPEN, IssueStatus.ACKNOWLEDGED]))
-    issues = [
-        IssueView(
-            id=row.id,
-            checker=row.checker,
-            issue_type=row.issue_type,
-            confidence=Confidence(row.confidence),
-            status=IssueStatus(row.status),
-            description=row.description,
-            evidence=[Evidence.model_validate(e) for e in row.evidence],
-            subjects=row.subjects or [],
-        )
-        for row in await session.scalars(query)
-    ]
-    issues.sort(
-        key=lambda i: (
-            _CONFIDENCE_ORDER[i.confidence],
-            min((e.chapter_number for e in i.evidence), default=0),
-        )
-    )
+    issues = sort_issues([issue_view(row) for row in await session.scalars(query)])
     return Report(book_id=book.id, title=book.title, issues=issues)
 
 

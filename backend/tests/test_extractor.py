@@ -84,3 +84,30 @@ def test_durations_are_not_ages():
     for raw in ["十八岁的林远", "今年二十五", "年方二八", "五水都小三十了吧", "今年十八岁",
                 "年纪二十出头", "十八年前，他才十八岁"]:  # fmt: skip
         assert ok(raw), raw
+
+
+def test_a_stored_extraction_round_trips():
+    from webfic.extraction.extractor import (
+        ChapterExtraction,
+        LocatedAge,
+        LocatedElapsed,
+        dump_extraction,
+        extraction_version,
+        load_extraction,
+    )
+    from webfic.extraction.schemas import AgeStatement, ElapsedTimeStatement, RevealedName
+
+    original = ChapterExtraction(
+        ages=[LocatedAge(AgeStatement(mention="林远", raw_text="林远三十来岁",
+                                      statement_type="absolute_age", value=30, value_max=39,
+                                      is_flashback=True, years_before_present=15,
+                                      years_before_present_quote="十五年前"), 3, 9)],
+        elapsed=[LocatedElapsed(ElapsedTimeStatement(raw_text="三年后", estimated_years=3), 0, 3)],
+        revealed_names=[RevealedName(known_as="疤脸刀客", real_name="沈砚")],
+        dropped=["幻觉"],
+    )  # fmt: skip
+    again = load_extraction(dump_extraction(original))
+    assert again.ages == original.ages and again.elapsed == original.elapsed
+    assert again.revealed_names == original.revealed_names and again.dropped == ["幻觉"]
+    assert again.llm_calls == 0
+    assert extraction_version("p", 8000, 500) != extraction_version("p", 8000, 400)

@@ -127,7 +127,10 @@ class _FactKeys:
     """Content-based keys for fingerprints. Fact ids are regenerated whenever a chapter is
     extracted again, so a fingerprint built on them would lose the author's status
     (intentional, acknowledged) after every recomputation. A key names the chapter, the
-    quote and, for a quote that occurs several times in the chapter, which occurrence."""
+    quote and, for a quote that occurs several times in the chapter, which occurrence.
+    Character ids are left out on purpose: recomputing from the chapter that introduced
+    a character creates it again under a new id, and the two statements already pin the
+    issue down."""
 
     def __init__(self, facts: list[AgeFact]):
         seen: dict[tuple[str, str], int] = {}
@@ -139,7 +142,7 @@ class _FactKeys:
             self._keys[f.id] = f"{chapter}|{f.raw_text}|{n}"
 
     def fingerprint(self, a: AgeFact, b: AgeFact) -> str:
-        return make_fingerprint(CHECKER_NAME, a.character_id, self._keys[a.id], self._keys[b.id])
+        return make_fingerprint(CHECKER_NAME, self._keys[a.id], self._keys[b.id])
 
 
 def _flashback_offset(fact: AgeFact) -> float | None:

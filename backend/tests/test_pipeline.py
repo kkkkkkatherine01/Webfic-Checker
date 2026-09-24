@@ -10,7 +10,7 @@ from tests import fakes
 from tests.fakes import FakeBackend
 from webfic.checkers.types import Confidence, IssueStatus
 from webfic.config import Settings
-from webfic.db.models import AgeFactRow, Chapter, Character, CharacterAlias, IssueRow
+from webfic.db.models import Chapter, Character, CharacterAlias, FactRow, IssueRow
 from webfic.services import checks, imports, reports
 
 USER = uuid.uuid4()
@@ -173,7 +173,7 @@ async def test_acknowledged_issue_that_no_longer_occurs_is_resolved(factory):
 
     # The author fixed chapter 3: its conflicting age is gone.
     async with factory() as session:
-        await session.execute(delete(AgeFactRow).where(AgeFactRow.chapter_number == 3))
+        await session.execute(delete(FactRow).where(FactRow.chapter_number == 3))
         await session.commit()
     async with factory() as session:
         again = await checks.run_checks(session, user_id=USER, book_id=job.book_id)

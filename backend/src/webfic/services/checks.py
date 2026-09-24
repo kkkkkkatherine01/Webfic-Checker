@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from webfic.checkers.age import AgeFact, ElapsedFact, check_ages
 from webfic.checkers.types import ConsistencyIssue, IssueStatus
-from webfic.db.models import AgeFactRow, Book, Character, ElapsedTimeFactRow, IssueRow
+from webfic.db.models import Book, Character, ElapsedTimeFactRow, FactRow, IssueRow
 from webfic.extraction.schemas import LifeStage
+from webfic.facts.registry import AGE
 from webfic.services.errors import NotFound
 
 
@@ -24,9 +25,13 @@ async def _load_age_facts(
 ) -> tuple[list[AgeFact], list[ElapsedFact]]:
     rows = (
         await session.execute(
-            select(AgeFactRow, Character.canonical_name)
-            .join(Character, Character.id == AgeFactRow.character_id)
-            .where(AgeFactRow.user_id == user_id, AgeFactRow.book_id == book_id)
+            select(FactRow, Character.canonical_name)
+            .join(Character, Character.id == FactRow.character_id)
+            .where(
+                FactRow.user_id == user_id,
+                FactRow.book_id == book_id,
+                FactRow.category == AGE.name,
+            )
         )
     ).all()
     ages = [
@@ -35,9 +40,9 @@ async def _load_age_facts(
             character_id=r.character_id,
             character_name=name,
             raw_text=r.raw_text,
-            statement_type=r.statement_type,
-            value=r.value,
-            life_stage=LifeStage(r.life_stage) if r.life_stage else None,
+            statement_type=r.attribute,
+            value=r.value_num,
+            life_stage=LifeStage(r.value_text) if r.value_text else None,
             is_flashback=r.is_flashback,
             years_before_present=r.years_before_present,
             value_max=r.value_max,

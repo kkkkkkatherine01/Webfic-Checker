@@ -14,15 +14,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from webfic.config import Settings
 from webfic.db.models import (
-    AgeFactRow,
     Book,
     Chapter,
     Character,
     CharacterAlias,
     ElapsedTimeFactRow,
+    FactRow,
 )
 from webfic.extraction.extractor import extract_chapter, load_prompt
 from webfic.extraction.resolver import CharacterIndex, KnownCharacter
+from webfic.facts.registry import AGE
 from webfic.ingest.splitter import split_chapters
 from webfic.llm.base import LLMClient, LLMError, ProviderError, ProviderErrorKind
 from webfic.services.errors import NotFound
@@ -195,7 +196,7 @@ async def run_import_job(
                 continue
 
             # Re-running a chapter replaces its earlier facts.
-            for model in (AgeFactRow, ElapsedTimeFactRow):
+            for model in (FactRow, ElapsedTimeFactRow):
                 await session.execute(delete(model).where(model.chapter_id == chapter_id))
 
             # Real names revealed in this chapter first, so statements using them resolve
@@ -203,24 +204,25 @@ async def run_import_job(
             for revealed in extraction.revealed_names:
                 index.reveal(revealed.known_as, revealed.real_name)
 
-            age_rows = []
+            fact_rows = []
             for located in extraction.ages:
                 s = located.statement
                 character_id = index.resolve(s.mention, s.resolved_name)
                 if character_id is None:
                     result.dropped_statements += 1
                     continue
-                age_rows.append(
-                    AgeFactRow(
+                fact_rows.append(
+                    FactRow(
                         user_id=user_id, book_id=book_id, chapter_id=chapter_id,
                         chapter_number=number, character_id=character_id,
+                        category=AGE.name, attribute=s.statement_type,
                         mention=s.mention, raw_text=s.raw_text,
-                        statement_type=s.statement_type, value=s.value,
-                        life_stage=s.life_stage.value if s.life_stage else None,
+                        value_num=s.value, value_max=s.value_max,
+                        value_text=s.life_stage.value if s.life_stage else None,
                         is_flashback=s.is_flashback,
                         years_before_present=s.years_before_present,
                         years_before_present_quote=s.years_before_present_quote,
-                        value_max=s.value_max, is_speculative=s.speculative,
+                        is_speculative=s.speculative, qualifiers={},
                         char_start=located.char_start, char_end=located.char_end,
                     )
                 )  # fmt: skip
@@ -243,7 +245,7 @@ async def run_import_job(
                     "chapter %s: merging character %s into %s",
                     number, merge.from_id, merge.into_id,
                 )  # fmt: skip
-                for model in (AgeFactRow, CharacterAlias):
+                for model in (FactRow, CharacterAlias):
                     await session.execute(
                         update(model)
                         .where(model.character_id == merge.from_id)
@@ -257,7 +259,7 @@ async def run_import_job(
                         alias=a.alias, first_chapter=number, source="extracted",
                     )
                 )  # fmt: skip
-            session.add_all(age_rows)
+            session.add_all(fact_rows)
             for located in extraction.elapsed:
                 e = located.statement
                 session.add(

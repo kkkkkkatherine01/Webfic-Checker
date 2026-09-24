@@ -92,18 +92,30 @@ class _ChapterFact(_Common):
     char_end: Mapped[int]
 
 
-class AgeFactRow(_ChapterFact, Base):
-    __tablename__ = "age_facts"
+class FactRow(_ChapterFact, Base):
+    """One statement about a character: an age today, appearance, a title... Categories
+    and their attributes are registered in `webfic.facts.registry`."""
+
+    __tablename__ = "facts"
+    __table_args__ = (
+        Index("ix_facts_book_character_category", "book_id", "character_id", "category"),
+    )
 
     character_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+    category: Mapped[str] = mapped_column(String(32))
+    # For ages the statement type: absolute_age / relative_age / birth_year / life_stage.
+    attribute: Mapped[str] = mapped_column(String(32))
     mention: Mapped[str] = mapped_column(Text)
-    statement_type: Mapped[str] = mapped_column(String(16))
-    value: Mapped[float | None]
-    life_stage: Mapped[str | None] = mapped_column(String(16))
+    value_num: Mapped[float | None]
+    value_max: Mapped[float | None]  # upper end of an approximate value ("三十来岁")
+    value_text: Mapped[str | None] = mapped_column(Text)  # e.g. the life stage
+    # When and how reliable, whatever the category: a statement may sit in a flashback
+    # (how long ago, and the text saying so) or be a guess, hypothetical or hearsay.
     years_before_present: Mapped[float | None]
-    value_max: Mapped[float | None]
-    is_speculative: Mapped[bool] = mapped_column(default=False)
     years_before_present_quote: Mapped[str | None] = mapped_column(Text)
+    is_speculative: Mapped[bool] = mapped_column(default=False)
+    # Category-specific extras, validated by the category's model in the registry.
+    qualifiers: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
 
 
 class ElapsedTimeFactRow(_ChapterFact, Base):

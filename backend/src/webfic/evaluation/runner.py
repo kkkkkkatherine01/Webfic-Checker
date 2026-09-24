@@ -13,11 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from webfic.config import Settings
 from webfic.db.models import (
-    AgeFactRow,
     Base,
     Character,
     CharacterAlias,
     ElapsedTimeFactRow,
+    FactRow,
     LLMCallRow,
 )
 from webfic.db.session import make_engine, make_session_factory
@@ -31,6 +31,7 @@ from webfic.evaluation.matching import (
     score_story,
 )
 from webfic.evaluation.metrics import SampleResult
+from webfic.facts.registry import AGE
 from webfic.llm.base import LLMClient
 from webfic.llm.cache import DbCallStore
 from webfic.llm.client import CallRecord, CallStore
@@ -77,7 +78,9 @@ async def _observe(factory: Factory, book_id: uuid.UUID, dropped: int) -> Observ
             await session.scalars(select(CharacterAlias).where(CharacterAlias.book_id == book_id))
         ).all()
         ages = (
-            await session.scalars(select(AgeFactRow).where(AgeFactRow.book_id == book_id))
+            await session.scalars(
+                select(FactRow).where(FactRow.book_id == book_id, FactRow.category == AGE.name)
+            )
         ).all()
         elapsed = (
             await session.scalars(
@@ -98,9 +101,9 @@ async def _observe(factory: Factory, book_id: uuid.UUID, dropped: int) -> Observ
                 chapter=a.chapter_number,
                 start=a.char_start,
                 end=a.char_end,
-                type=a.statement_type,
-                value=a.value,
-                life_stage=a.life_stage,
+                type=a.attribute,
+                value=a.value_num,
+                life_stage=a.value_text,
                 flashback=a.is_flashback,
                 years_before_present=a.years_before_present,
                 value_max=a.value_max,

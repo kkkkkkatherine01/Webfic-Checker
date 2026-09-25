@@ -154,7 +154,7 @@ EMBEDDING_DIM = 512  # BAAI/bge-small-zh-v1.5
 
 
 class PassageRow(_Common, Base):
-    """Archival layer: a short passage of a chapter's text (about 300 characters, cut at
+    """Archival layer: a short passage of a chapter's text (about 500 characters, cut at
     sentence ends, overlapping its neighbours), with its embedding and its jieba tokens
     for keyword search. Passages depend only on their chapter's text."""
 

@@ -20,7 +20,7 @@ def sentence_ends(text: str) -> list[int]:
     return ends
 
 
-def split_passages(text: str, size: int = 300, overlap: int = 60) -> list[tuple[int, int]]:
+def split_passages(text: str, size: int = 500, overlap: int = 100) -> list[tuple[int, int]]:
     """(start, end) offsets of passages of about `size` characters, cut at sentence ends,
     each starting about `overlap` characters before the previous one ended. A sentence
     longer than `size` is cut hard, so no passage is much longer than `size`."""

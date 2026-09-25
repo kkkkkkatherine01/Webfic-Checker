@@ -37,9 +37,10 @@ class Settings(BaseSettings):
     chunk_size: int = 8000
     chunk_overlap: int = 500
 
-    # Passage search (Archival layer): small passages, unrelated to extraction chunks.
-    passage_size: int = 300
-    passage_overlap: int = 60
+    # Passage search (Archival layer): short passages, unrelated to extraction chunks.
+    # 500/100 won the retrieval evaluation (step 3b-2) over 300/60 and 200/40.
+    passage_size: int = 500
+    passage_overlap: int = 100
     embed_model: str = "BAAI/bge-small-zh-v1.5"
     # Where the embedding model and the jieba dictionary cache live (fastembed/ and jieba/
     # under it). None leaves the libraries' defaults, which are on the system drive.

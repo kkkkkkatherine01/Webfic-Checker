@@ -74,6 +74,15 @@ class ExpectedFacts(BaseModel):
     not_elapsed: list[Trap] = []  # must not be extracted as an "advance" time span
 
 
+class RetrievalQuestion(BaseModel):
+    """A question the agent might ask, and where the text answers it; finding any one of
+    the expected passages counts."""
+
+    query: str
+    character: str | None = None  # search only passages mentioning this character
+    expect: list[Trap] = Field(min_length=1)
+
+
 class SettingsOverride(BaseModel):
     """Per-story pipeline settings, e.g. a small chunk size so a short test chapter
     still exercises chunked extraction."""
@@ -90,6 +99,7 @@ class Golden(BaseModel):
     allowed: list[AllowedIssue] = []
     not_aliases: list[str] = []  # must not be any character's name or alias
     facts: ExpectedFacts = ExpectedFacts()
+    retrieval: list[RetrievalQuestion] = []
 
     @model_validator(mode="after")
     def _names_are_unique_and_known(self) -> "Golden":
@@ -101,6 +111,7 @@ class Golden(BaseModel):
                 seen[n] = name
         refs = [i.character for i in self.issues] + [a.character for a in self.allowed]
         refs += [a.character for a in self.facts.ages]
+        refs += [q.character for q in self.retrieval if q.character]
         for ref in refs:
             if ref not in self.characters:
                 raise ValueError(f"「{ref}」不在 characters 里")
@@ -164,6 +175,7 @@ def _check_quotes(story: Story) -> None:
     quoted = [(a.chapter, a.quote) for a in g.facts.ages]
     quoted += [(e.chapter, e.quote) for e in g.facts.elapsed]
     quoted += [(t.chapter, t.quote) for t in [*g.facts.not_ages, *g.facts.not_elapsed]]
+    quoted += [(e.chapter, e.quote) for q in g.retrieval for e in q.expect]
     for chapter, quote in quoted:
         if not 1 <= chapter <= n:
             problems.append(f"第 {chapter} 章不存在（共 {n} 章）：{quote}")

@@ -30,8 +30,8 @@ class Archival:
     embedder: Embedder
     tokenizer: Tokenizer
     embed_model: str
-    passage_size: int = 300
-    passage_overlap: int = 60
+    passage_size: int = 500
+    passage_overlap: int = 100
 
     def source_key(self, chapter: Chapter) -> str:
         key = (

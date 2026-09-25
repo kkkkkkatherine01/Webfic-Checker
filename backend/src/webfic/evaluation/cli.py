@@ -260,5 +260,150 @@ def compare(
                 console.print(f"  {item}")
 
 
+@app.command("retrieval-prepare")
+def retrieval_prepare(
+    passage_size: Annotated[int | None, typer.Option(help="检索段落长度，默认用配置")] = None,
+    passage_overlap: Annotated[int | None, typer.Option(help="相邻段落重叠，默认用配置")] = None,
+) -> None:
+    """为检索评估准备 DetectiveQA 语料：导入并建索引（本地计算，可中断后续跑）。"""
+    from webfic.archival.index import platform_archival
+    from webfic.db.session import make_engine, make_session_factory
+    from webfic.evaluation.retrieval import detectiveqa_corpus, prepare
+
+    settings = get_settings()
+    updates = {
+        k: v
+        for k, v in {"passage_size": passage_size, "passage_overlap": passage_overlap}.items()
+        if v
+    }
+    settings = settings.model_copy(update=updates)
+    corpus = detectiveqa_corpus(EVAL_DIR / "external" / "detectiveqa")
+    if not corpus:
+        console.print(
+            "[red]没有找到 DetectiveQA 数据：先运行 python eval/download_external.py detectiveqa[/]"
+        )
+        raise typer.Exit(1)
+
+    async def main() -> None:
+        engine = make_engine(settings.database_url)
+        try:
+            await prepare(
+                make_session_factory(engine), platform_archival(settings), corpus, console.print
+            )
+        finally:
+            await engine.dispose()
+
+    console.print(
+        f"DetectiveQA {len(corpus)} 部，{sum(len(c.text) for c in corpus)} 字；"
+        f"段落 {settings.passage_size}/{settings.passage_overlap}"
+    )
+    asyncio.run(main())
+
+
+@app.command()
+def retrieval(
+    corpus: Annotated[
+        str, typer.Option(help="golden、detectiveqa（原问题 + 线索描述两套查询），逗号分隔")
+    ] = "golden",
+    sizes: Annotated[str, typer.Option(help="段落长度-重叠，逗号分隔，如 300-60,200-40")] = "",
+    modes: Annotated[str, typer.Option(help="hybrid、vector、keyword，逗号分隔")] = (
+        "hybrid,vector,keyword"
+    ),
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "retrieval",
+    golden_dir: GoldenDir = EVAL_DIR / "golden",
+) -> None:
+    """检索评估：命中率@5/@10、线索覆盖率@10、MRR（本地计算；缺的索引会先建好）。"""
+    import dataclasses
+
+    from webfic.archival.index import platform_archival
+    from webfic.db.session import make_engine, make_session_factory
+    from webfic.evaluation import retrieval as rv
+    from webfic.evaluation.runner import EvalCallStore
+    from webfic.llm.cache import DbCallStore
+
+    settings = get_settings()
+    corpora = [c.strip() for c in corpus.split(",") if c.strip()]
+    wanted_modes = [m.strip() for m in modes.split(",") if m.strip()]
+    base = platform_archival(settings)
+    variants = [base]
+    if sizes:
+        variants = []
+        for item in sizes.split(","):
+            size, _, overlap = item.strip().partition("-")
+            variants.append(
+                dataclasses.replace(base, passage_size=int(size), passage_overlap=int(overlap))
+            )
+
+    stories = (
+        [s for s in _load(golden_dir, None) if s.golden.retrieval] if "golden" in corpora else []
+    )
+    dqa_folder = EVAL_DIR / "external" / "detectiveqa"
+    dqa_questions, dqa_clues, skipped = (
+        rv.detectiveqa_questions(dqa_folder) if "detectiveqa" in corpora else ([], [], 0)
+    )
+
+    async def main() -> list[rv.Scores]:
+        engine = make_engine(settings.database_url)
+        factory = make_session_factory(engine)
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+
+        def extract(item: rv.CorpusText):
+            story = next(s for s in stories if f"golden/{s.id}" == item.name)
+            story_settings = settings.model_copy(
+                update=story.golden.settings.model_dump(exclude_none=True)
+            )
+            store = EvalCallStore(
+                DbCallStore(factory, user_id=rv.RETRIEVAL_USER), DbCallStore(cache, user_id=None),
+                fresh=False,
+            )  # fmt: skip
+            return platform_client(story_settings, store), story_settings
+
+        results: list[rv.Scores] = []
+        try:
+            for archival in variants:
+                runs = []
+                if stories:
+                    books = await rv.prepare(
+                        factory, archival, rv.golden_corpus(stories), console.print, extract
+                    )
+                    runs.append(("golden", books, rv.golden_questions(stories)))
+                if dqa_questions:
+                    books = await rv.prepare(
+                        factory, archival, rv.detectiveqa_corpus(dqa_folder), console.print
+                    )
+                    runs.append(("detectiveqa", books, dqa_questions))
+                    runs.append(("detectiveqa-clues", books, dqa_clues))
+                for name, books, questions in runs:
+                    for mode in wanted_modes:
+                        outcomes = await rv.evaluate(factory, archival, books, questions, mode)
+                        results.append(rv.aggregate(name, archival, mode, outcomes))
+        finally:
+            await engine.dispose()
+        return results
+
+    scores = asyncio.run(main())
+    table = Table("语料", "段落", "方式", "问题数", "命中@5", "命中@10", "线索覆盖@10", "MRR")
+    for s in scores:
+        table.add_row(
+            s.corpus, f"{s.passage_size}/{s.passage_overlap}", s.mode, str(s.questions),
+            f"{s.hit_at_5:.0%}", f"{s.hit_at_10:.0%}", f"{s.coverage_at_10:.0%}", f"{s.mrr:.2f}",
+        )  # fmt: skip
+    console.print(table)
+    for s in scores:
+        if s.corpus == "golden" and s.missed:
+            console.print(f"\n[bold]{s.passage_size}/{s.passage_overlap} {s.mode} 没找到[/]")
+            for q in s.missed:
+                console.print(f"  {q}")
+    report = rv.RetrievalReport(
+        label=label, created_at=datetime.now().astimezone(), embed_model=settings.embed_model,
+        scores=scores, skipped_clues=skipped,
+    )  # fmt: skip
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-retrieval-{label}.json"
+    path.write_text(report.model_dump_json(indent=2), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+
+
 if __name__ == "__main__":
     app()

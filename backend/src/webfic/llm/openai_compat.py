@@ -11,6 +11,8 @@ from webfic.llm.base import (
     ProviderError,
     ProviderErrorKind,
     RawCompletion,
+    ToolCall,
+    ToolSpec,
     Usage,
 )
 
@@ -35,15 +37,19 @@ class OpenAICompatBackend:
         json_mode: bool,
         extra: dict[str, Any] | None = None,
         temperature: float | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> RawCompletion:
         optional: dict[str, Any] = {}
         if temperature is not None:
             optional["temperature"] = temperature
+        if json_mode:
+            optional["response_format"] = {"type": "json_object"}
+        if tools:
+            optional["tools"] = [tool_payload(t) for t in tools]
         try:
             response = await self._client.chat.completions.create(
                 model=model,
-                messages=[{"role": m.role, "content": m.content} for m in messages],  # type: ignore[misc]
-                response_format={"type": "json_object"} if json_mode else {"type": "text"},
+                messages=[message_payload(m) for m in messages],  # type: ignore[misc]
                 extra_body=extra or None,
                 **optional,
             )
@@ -53,8 +59,42 @@ class OpenAICompatBackend:
         choice = response.choices[0]
         if choice.finish_reason == "content_filter":
             raise ProviderError(ProviderErrorKind.CONTENT_FILTER, "输出被服务商的内容审核拦截")
-        text = choice.message.content or ""
-        return RawCompletion(text=text, usage=_usage(response.usage), model=response.model)
+        message = choice.message
+        return RawCompletion(
+            text=message.content or "",
+            usage=_usage(response.usage),
+            model=response.model,
+            tool_calls=[
+                ToolCall(id=c.id, name=c.function.name, arguments=c.function.arguments or "")
+                for c in message.tool_calls or []
+                if c.type == "function"
+            ],
+            # DeepSeek returns its thinking beside the answer.
+            reasoning=(message.model_extra or {}).get("reasoning_content") or None,
+        )
+
+
+def message_payload(message: ChatMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
+            for c in message.tool_calls
+        ]
+    if message.tool_call_id is not None:
+        payload["tool_call_id"] = message.tool_call_id
+    return payload
+
+
+def tool_payload(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    }
 
 
 def translate_error(exc: openai.APIError) -> ProviderError:

@@ -266,3 +266,55 @@ class LLMCallRow(_Common, Base):
     latency_ms: Mapped[int] = mapped_column(default=0)
     cache_hit: Mapped[bool] = mapped_column(default=False)
     ok: Mapped[bool] = mapped_column(default=False)
+
+
+class AgentRunRow(_Common, Base):
+    """One agent run (a trace): which agent, on what, with which setup, and how it ended.
+    Field names follow OpenTelemetry (trace / span ids) so runs can be exported later."""
+
+    __tablename__ = "agent_runs"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    agent: Mapped[str] = mapped_column(String(32))  # e.g. "verify"
+    subject: Mapped[str | None] = mapped_column(String(64))  # e.g. the issue's fingerprint
+    trace_id: Mapped[str] = mapped_column(String(32))
+    span_id: Mapped[str] = mapped_column(String(16))  # the run's root span
+    config: Mapped[dict[str, Any]] = mapped_column(JsonType)  # model, tier, prompt, budget
+    # running / done / budget_exhausted / guard_failed / failed
+    status: Mapped[str] = mapped_column(String(24))
+    result: Mapped[dict[str, Any] | None] = mapped_column(JsonType)  # the submitted answer
+    error: Mapped[str | None] = mapped_column(Text)
+    turns: Mapped[int] = mapped_column(default=0)  # model calls
+    tool_calls: Mapped[int] = mapped_column(default=0)
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentStepRow(_Common, Base):
+    """One step of an agent run (a span): a model call, a tool call or a guard check."""
+
+    __tablename__ = "agent_steps"
+    __table_args__ = (UniqueConstraint("run_id", "seq"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("books.id", ondelete="CASCADE"))
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int]
+    span_id: Mapped[str] = mapped_column(String(16))
+    parent_span_id: Mapped[str] = mapped_column(String(16))
+    kind: Mapped[str] = mapped_column(String(8))  # llm / tool / guard
+    name: Mapped[str] = mapped_column(String(64))  # model or tool name
+    input: Mapped[Any] = mapped_column(JsonType)
+    output: Mapped[Any] = mapped_column(JsonType)
+    error: Mapped[str | None] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(default=0)
+    output_tokens: Mapped[int] = mapped_column(default=0)
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))
+    latency_ms: Mapped[int] = mapped_column(default=0)

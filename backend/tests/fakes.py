@@ -23,7 +23,7 @@ class FakeBackend:
         self.calls: list[list[ChatMessage]] = []
 
     async def chat(
-        self, *, model, messages, json_mode, extra=None, temperature=None
+        self, *, model, messages, json_mode, extra=None, temperature=None, tools=None
     ) -> RawCompletion:
         self.calls.append(list(messages))
         answer = self._respond(messages)
@@ -78,3 +78,48 @@ def make_archival(tmp_path, size: int = 300, overlap: int = 60):
         embedder=HashEmbedder(), tokenizer=Tokenizer(tmp_path), embed_model="hash",
         passage_size=size, passage_overlap=overlap,
     )  # fmt: skip
+
+
+class ScriptedBackend:
+    """A fake model for agents. Each turn replies with the next scripted item: a list of
+    (tool name, arguments) calls, plain text, or an exception to raise. A callable item
+    gets the messages so far and returns one of those."""
+
+    provider = "fake"
+
+    def __init__(self, turns):
+        self._turns = iter(turns)
+        self.calls: list[list[ChatMessage]] = []
+        self.tools_seen = []
+
+    async def chat(
+        self, *, model, messages, json_mode, extra=None, temperature=None, tools=None
+    ) -> RawCompletion:
+        from webfic.llm.base import ToolCall
+
+        self.calls.append(list(messages))
+        self.tools_seen.append(tools)
+        turn = next(self._turns)
+        if callable(turn):
+            turn = turn(messages)
+        if isinstance(turn, Exception):
+            raise turn
+        usage = Usage(1000, 200, 100)
+        if isinstance(turn, str):
+            return RawCompletion(text=turn, usage=usage, model=model)
+        calls = [
+            ToolCall(
+                id=f"call_{len(self.calls)}_{i}",
+                name=name,
+                arguments=args if isinstance(args, str) else json.dumps(args, ensure_ascii=False),
+            )
+            for i, (name, args) in enumerate(turn)
+        ]
+        return RawCompletion(
+            text="", usage=usage, model=model, tool_calls=calls, reasoning="先查证"
+        )
+
+
+def agent_llm(backend, store=None) -> JsonLLMClient:
+    tiers = {Tier.EXTRACT: TierConfig("deepseek-flash"), Tier.REASON: TierConfig("deepseek-v4-pro")}
+    return JsonLLMClient(backend, tiers, store=store or MemoryCallStore())

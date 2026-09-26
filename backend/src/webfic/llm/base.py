@@ -1,6 +1,6 @@
 """Provider-neutral LLM interface. Business code depends only on this module."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Protocol
@@ -60,6 +60,47 @@ class ProviderError(LLMError):
         self.message = message
 
 
+@dataclass
+class ToolCall:
+    """A tool the model asked to run. `arguments` is the model's JSON text, unchecked."""
+
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass
+class ToolSpec:
+    """A tool offered to the model: `parameters` is a JSON Schema object."""
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+@dataclass
+class ChatMessage:
+    role: str  # "system" | "user" | "assistant" | "tool"
+    content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)  # assistant: tools it called
+    tool_call_id: str | None = None  # tool: which call this is the result of
+
+
+@dataclass
+class ChatTurn:
+    """One reply of the model in a tool-using conversation."""
+
+    text: str
+    tool_calls: list[ToolCall]
+    # The model's thinking, when the provider returns it (DeepSeek thinking mode). Kept
+    # for the execution record only: it is not sent back, which providers do not need.
+    reasoning: str | None
+    usage: Usage
+    cost_usd: Decimal
+    model: str
+    cache_hit: bool
+
+
 class LLMClient(Protocol):
     async def generate_json[T: BaseModel](
         self,
@@ -74,14 +115,20 @@ class LLMClient(Protocol):
         can reuse their prefix cache; put per-call content in `user`."""
         ...
 
+    async def chat(
+        self,
+        *,
+        tier: Tier,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        purpose: str,
+    ) -> ChatTurn:
+        """One model turn with native function calling (agents). Cached and recorded
+        like `generate_json`; tool arguments are returned unchecked."""
+        ...
+
 
 # --- lower-level pieces used by the implementation -------------------------------------
-
-
-@dataclass
-class ChatMessage:
-    role: str  # "system" | "user" | "assistant"
-    content: str
 
 
 @dataclass
@@ -89,6 +136,8 @@ class RawCompletion:
     text: str
     usage: Usage
     model: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning: str | None = None
 
 
 class ChatBackend(Protocol):
@@ -104,4 +153,5 @@ class ChatBackend(Protocol):
         json_mode: bool,
         extra: dict[str, Any] | None = None,
         temperature: float | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> RawCompletion: ...

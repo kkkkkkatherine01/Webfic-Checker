@@ -10,7 +10,17 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
-from webfic.llm.base import ChatBackend, ChatMessage, LLMError, LLMResult, Tier, Usage
+from webfic.llm.base import (
+    ChatBackend,
+    ChatMessage,
+    ChatTurn,
+    LLMError,
+    LLMResult,
+    Tier,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
 from webfic.llm.pricing import cost_of
 
 
@@ -64,6 +74,42 @@ def _request_hash(
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _chat_hash(
+    provider: str, tier: TierConfig, messages: list[ChatMessage], tools: list[ToolSpec]
+) -> str:
+    payload = {
+        "provider": provider,
+        "model": tier.model,
+        "extra": tier.extra,
+        "temperature": tier.temperature,
+        "messages": [
+            [m.role, m.content, [[c.id, c.name, c.arguments] for c in m.tool_calls], m.tool_call_id]
+            for m in messages
+        ],
+        "tools": [[t.name, t.description, t.parameters] for t in tools],
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _dump_turn(text: str, tool_calls: list[ToolCall], reasoning: str | None) -> str:
+    """A tool-using reply as stored in the cache (`llm_calls.response_text`)."""
+    return json.dumps(
+        {
+            "text": text,
+            "tool_calls": [[c.id, c.name, c.arguments] for c in tool_calls],
+            "reasoning": reasoning,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _load_turn(blob: str) -> tuple[str, list[ToolCall], str | None]:
+    data = json.loads(blob)
+    calls = [ToolCall(id=i, name=n, arguments=a) for i, n, a in data["tool_calls"]]
+    return data["text"], calls, data.get("reasoning")
 
 
 def _parse[T: BaseModel](text: str, schema: type[T]) -> T:
@@ -174,4 +220,59 @@ class JsonLLMClient:
 
         raise LLMError(
             f"{purpose}: no valid JSON after {self._max_retries + 1} attempts: {last_error}"
+        )
+
+    async def chat(
+        self,
+        *,
+        tier: Tier,
+        messages: list[ChatMessage],
+        tools: list[ToolSpec],
+        purpose: str,
+    ) -> ChatTurn:
+        tier_config = self._tiers[tier]
+        provider = self._backend.provider
+        request_hash = _chat_hash(provider, tier_config, messages, tools)
+        cached = await self._store.lookup(request_hash)
+        if cached is not None:
+            text, tool_calls, reasoning = _load_turn(cached)
+            usage, cost, model, latency_ms = Usage(), Decimal(0), tier_config.model, 0
+        else:
+            started = time.monotonic()
+            completion = await self._backend.chat(
+                model=tier_config.model,
+                messages=messages,
+                json_mode=False,
+                extra=tier_config.extra,
+                temperature=tier_config.temperature,
+                tools=tools,
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+            text, tool_calls, reasoning = (
+                completion.text, completion.tool_calls, completion.reasoning
+            )  # fmt: skip
+            usage, model = completion.usage, completion.model
+            cost = cost_of(tier_config.model, usage)
+        await self._store.record(
+            CallRecord(
+                purpose=purpose,
+                provider=provider,
+                model=model,
+                request_hash=request_hash,
+                response_text=_dump_turn(text, tool_calls, reasoning),
+                usage=usage,
+                cost_usd=cost,
+                latency_ms=latency_ms,
+                cache_hit=cached is not None,
+                ok=True,
+            )
+        )
+        return ChatTurn(
+            text=text,
+            tool_calls=tool_calls,
+            reasoning=reasoning,
+            usage=usage,
+            cost_usd=cost,
+            model=model,
+            cache_hit=cached is not None,
         )

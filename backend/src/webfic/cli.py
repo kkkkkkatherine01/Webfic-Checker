@@ -1,6 +1,7 @@
 """Command-line entry point. A thin shell: every command calls one service function."""
 
 import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 from rich.table import Table
 from sqlalchemy.exc import DBAPIError
@@ -21,7 +23,7 @@ from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
 from webfic.memory import archival, core
-from webfic.services import chapters, checks, imports, reports
+from webfic.services import chapters, checks, imports, reports, traces
 from webfic.services.errors import InvalidEdit, NotFound
 
 app = typer.Typer(help="网文一致性检查工具", no_args_is_help=True, add_completion=False)
@@ -496,6 +498,90 @@ def books() -> None:
                 str(b.characters), b.created_at.astimezone().strftime("%Y-%m-%d %H:%M"),
             )  # fmt: skip
         console.print(table)
+
+    _run(main)
+
+
+# --- agent execution records ----------------------------------------------------------
+
+
+_RUN_STATUS = {
+    "done": "[green]完成[/]",
+    "budget_exhausted": "[yellow]预算用尽[/]",
+    "guard_failed": "[yellow]结论多次未通过检查[/]",
+    "failed": "[red]失败[/]",
+    "running": "[dim]进行中或中断[/]",
+}
+
+
+def _short(value: object, limit: int = 300) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = text.replace("\n", " ")
+    return escape(text if len(text) <= limit else text[:limit] + "…")
+
+
+@app.command()
+def runs(book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")]) -> None:
+    """列出作品最近的 agent 运行记录。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        async with factory() as session:
+            items = await traces.list_runs(session, user_id=settings.dev_user_id, book_id=book_id)
+        table = Table("运行", "agent", "对象", "状态", "轮数", "工具调用", "花费 $", "时间")
+        for r in items:
+            table.add_row(
+                str(r.id)[:8], r.agent, (r.subject or "")[:12], _RUN_STATUS.get(r.status, r.status),
+                str(r.turns), str(r.tool_calls), f"{r.cost_usd:.4f}",
+                r.created_at.astimezone().strftime("%m-%d %H:%M"),
+            )  # fmt: skip
+        console.print(table)
+
+    _run(main)
+
+
+@app.command()
+def trace(
+    run: Annotated[str, typer.Argument(help="运行 ID（可只写前几位，见 webfic runs）")],
+) -> None:
+    """逐步查看一次 agent 运行：每次模型调用、工具调用和检查。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        async with factory() as session:
+            view = await traces.get_run(session, user_id=settings.dev_user_id, run=run)
+        console.print(
+            f"[bold]{view.agent}[/] {view.id}  {_RUN_STATUS.get(view.status, view.status)}"
+            f"  {view.turns} 轮 / {view.tool_calls} 次工具调用 / "
+            f"输入 {view.input_tokens} 输出 {view.output_tokens} tokens / ${view.cost_usd:.4f}"
+        )
+        console.print(f"[dim]配置：{_short(view.config)}[/]")
+        for s in view.steps:
+            cost = (
+                f"  {s.input_tokens}+{s.output_tokens} tok ${s.cost_usd:.4f}"
+                if s.kind == "llm"
+                else ""
+            )
+            console.print(
+                f"\n[bold]{s.seq}. {s.kind} {escape(s.name)}[/]  [dim]{s.latency_ms} ms{cost}[/]"
+            )
+            if s.kind == "llm":
+                output = s.output or {}
+                if output.get("reasoning"):
+                    console.print(f"   [dim]思考：{_short(output['reasoning'])}[/]")
+                if output.get("text"):
+                    console.print(f"   {_short(output['text'])}")
+                for c in output.get("tool_calls", []):
+                    console.print(f"   → {escape(c['name'])} {_short(c['arguments'], 200)}")
+            else:
+                console.print(f"   参数：{_short(s.input, 200)}")
+                if s.output is not None:
+                    console.print(f"   结果：{_short(s.output)}")
+            if s.error:
+                console.print(f"   [red]{_short(s.error)}[/]")
+        if view.result is not None:
+            console.print(f"\n[bold]结论[/]：{_short(view.result, 1000)}")
+        if view.error:
+            console.print(f"\n[red]结束原因：{_short(view.error)}[/]")
 
     _run(main)
 

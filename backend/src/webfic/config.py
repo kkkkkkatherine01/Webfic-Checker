@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Extraction should be as repeatable as possible; None leaves the provider default.
     llm_extract_temperature: float | None = 0.0
     llm_reason_temperature: float | None = None
+    # The verify agent (step 4-3 compared flash with and without thinking and v4-pro: same
+    # accuracy, flash without thinking 3-6 times cheaper).
+    llm_verify_model: str = "deepseek-flash"
+    llm_verify_extra: dict[str, Any] = {"thinking": {"type": "disabled"}}
+    llm_verify_temperature: float | None = None
     llm_max_retries: int = 2
 
     chunk_size: int = 8000

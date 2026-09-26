@@ -70,6 +70,8 @@ class IssueOutcome(BaseModel):
     issue_id: uuid.UUID
     description: str
     verification: VerificationView
+    turns: int  # model calls
+    tool_calls: int
 
 
 class VerifyResult(BaseModel):
@@ -219,9 +221,13 @@ async def verify_issues(
     again: bool = False,
     archival: Archival | None = None,
     budget: Budget | None = None,
+    trace_factory: Factory | None = None,
+    prompt_version: str = PROMPT_VERSION,
 ) -> VerifyResult:
     """Run the verify agent on the book's open and acknowledged issues that have no
-    valid verdict yet (all of them with `again`), one after another."""
+    valid verdict yet (all of them with `again`), one after another. `trace_factory`
+    (default: `factory`) is where execution records go: the evaluation verifies inside a
+    transaction it rolls back, but keeps the records."""
     async with factory() as session:
         owned = select(Book.id).where(Book.id == book_id, Book.user_id == user_id)
         if await session.scalar(owned) is None:
@@ -239,21 +245,22 @@ async def verify_issues(
         todo = [(i, verification_key(i, hashes)) for i in issues if i.id not in valid]
         tasks = {i.id: await build_task(session, user_id, book_id, i) for i, _ in todo}
 
-    system = load_prompt()
+    system = load_prompt(prompt_version)
     tools = verify_tools()
     context = ToolContext(factory=factory, user_id=user_id, book_id=book_id, archival=archival)
     config = {
-        "prompt": PROMPT_VERSION,
-        "model": settings.llm_reason_model,
-        "extra": settings.llm_reason_extra,
+        "prompt": prompt_version,
+        "model": settings.llm_verify_model,
+        "extra": settings.llm_verify_extra,
     }
     verified: list[IssueOutcome] = []
     cost = Decimal(0)
     for issue, key in todo:
         result = await run_agent(
             llm, agent="verify", system=system, task=tasks[issue.id], tools=tools,
-            context=context, trace=TraceWriter(factory, user_id=user_id, book_id=book_id),
-            budget=budget, tier=Tier.REASON, subject=issue.fingerprint,
+            context=context,
+            trace=TraceWriter(trace_factory or factory, user_id=user_id, book_id=book_id),
+            budget=budget, tier=Tier.VERIFY, subject=issue.fingerprint,
             config={**config, "issue_id": str(issue.id)},
         )  # fmt: skip
         answer = result.result or {}
@@ -261,8 +268,8 @@ async def verify_issues(
             user_id=user_id, book_id=book_id, issue_id=issue.id, key=key,
             run_id=result.run_id, status=result.status, verdict=answer.get("verdict"),
             reason=answer.get("reason"), explanation=answer.get("explanation") or result.error,
-            evidence=answer.get("evidence", []), model=settings.llm_reason_model,
-            prompt_version=PROMPT_VERSION, cost_usd=result.spend.cost_usd,
+            evidence=answer.get("evidence", []), model=settings.llm_verify_model,
+            prompt_version=prompt_version, cost_usd=result.spend.cost_usd,
             # Set here, to the microsecond: the latest valid verdict wins, and the
             # database's own timestamp is only to the second on SQLite.
             created_at=datetime.now(UTC),
@@ -273,8 +280,11 @@ async def verify_issues(
             await session.refresh(row)
         cost += result.spend.cost_usd
         verified.append(
-            IssueOutcome(issue_id=issue.id, description=issue.description, verification=_view(row))
-        )
+            IssueOutcome(
+                issue_id=issue.id, description=issue.description, verification=_view(row),
+                turns=result.spend.turns, tool_calls=result.spend.tool_calls,
+            )
+        )  # fmt: skip
     return VerifyResult(
         pending=len(todo), verified=verified, already=len(issues) - len(todo), cost_usd=cost
     )

@@ -10,7 +10,7 @@ decides how the report shows the issue.
 from importlib import resources
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 
 from webfic.agent.tools import RunState, Tool, ToolArgs, ToolContext, ToolRegistry
@@ -19,7 +19,7 @@ from webfic.extraction.locator import locate
 from webfic.memory import archival as archival_memory
 from webfic.memory import core, recall
 
-PROMPT_VERSION = "verify_v1"
+PROMPT_VERSION = "verify_v2"
 
 Verdict = Literal["contradiction", "false_alarm", "needs_author"]
 Reason = Literal[
@@ -54,6 +54,12 @@ REASON_LABEL = {
 }
 
 MAX_CONTEXT = 1500
+# One read returns at most this much text: the requested span is cut to MAX_SPAN and the
+# context around it shrunk to fit. Reads measured in 4-3: median 709, 99% under 1400 chars;
+# the cap only stops runaway requests.
+MAX_READ = 3000
+MAX_SPAN = 2000
+MAX_SEARCH = 5  # passages per search (500 characters each)
 MAX_ITEMS = 40
 
 
@@ -70,18 +76,27 @@ class ReadPassageArgs(ToolArgs):
     end: int = Field(description="结束位置")
     context: int = Field(default=300, ge=0, le=MAX_CONTEXT, description="前后各多读多少字")
 
+    @model_validator(mode="after")
+    def _ordered(self) -> "ReadPassageArgs":
+        if self.end < self.start:
+            raise ValueError("end 不能小于 start")
+        return self
+
 
 async def read_passage(ctx: ToolContext, args: ReadPassageArgs) -> str:
+    end = min(args.end, args.start + MAX_SPAN)
+    context = min(args.context, (MAX_READ - (end - args.start)) // 2)
     async with ctx.factory() as session:
         shown = await archival_memory.read_passage(
             session, user_id=ctx.user_id, book_id=ctx.book_id, chapter=args.chapter,
-            start=args.start, end=args.end, context=args.context,
+            start=args.start, end=end, context=context,
         )  # fmt: skip
+    cut = f"（请求的范围超过 {MAX_SPAN} 字，只返回前 {MAX_SPAN} 字）" if end < args.end else ""
     t = shown.text
     marked = t[: shown.focus_start] + "【" + t[shown.focus_start : shown.focus_end] + "】"
     return (
         f"第 {shown.chapter_number} 章「{shown.chapter_title}」{shown.char_start}–{shown.char_end}"
-        f"（【】内是请求的位置）：\n{marked}{t[shown.focus_end :]}"
+        f"（【】内是请求的位置）{cut}：\n{marked}{t[shown.focus_end :]}"
     )
 
 
@@ -90,7 +105,7 @@ class SearchTextArgs(ToolArgs):
     character: str | None = Field(default=None, description="只看提到这个角色（名字或别名）的段落")
     first_chapter: int | None = Field(default=None, description="章节范围起点")
     last_chapter: int | None = Field(default=None, description="章节范围终点")
-    k: int = Field(default=5, ge=1, le=8, description="返回几段")
+    k: int = Field(default=5, ge=1, le=MAX_SEARCH, description="返回几段")
 
 
 class PassageBrief(BaseModel):

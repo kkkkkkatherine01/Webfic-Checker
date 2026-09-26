@@ -8,7 +8,11 @@ from webfic.llm.client import CallRecord, JsonLLMClient, TierConfig
 
 
 def make_llm(backend, factory, *, user_id, book_id) -> JsonLLMClient:
-    tiers = {Tier.EXTRACT: TierConfig("deepseek-flash"), Tier.REASON: TierConfig("deepseek-v4-pro")}
+    tiers = {
+        Tier.EXTRACT: TierConfig("deepseek-flash"),
+        Tier.REASON: TierConfig("deepseek-v4-pro"),
+        Tier.VERIFY: TierConfig("deepseek-flash"),
+    }
     store = DbCallStore(factory, user_id=user_id, book_id=book_id)
     return JsonLLMClient(backend, tiers, store=store)
 
@@ -121,5 +125,9 @@ class ScriptedBackend:
 
 
 def agent_llm(backend, store=None) -> JsonLLMClient:
-    tiers = {Tier.EXTRACT: TierConfig("deepseek-flash"), Tier.REASON: TierConfig("deepseek-v4-pro")}
+    tiers = {
+        Tier.EXTRACT: TierConfig("deepseek-flash"),
+        Tier.REASON: TierConfig("deepseek-v4-pro"),
+        Tier.VERIFY: TierConfig("deepseek-flash"),
+    }
     return JsonLLMClient(backend, tiers, store=store or MemoryCallStore())

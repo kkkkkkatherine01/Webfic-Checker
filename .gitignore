@@ -44,3 +44,4 @@ eval/baseline*.json
 eval/*-baseline*.json
 # Downloaded evaluation corpora (WebNovelBench, 蜀山剑侠传, DetectiveQA)
 eval/external/
+eval/verify-plan*.json

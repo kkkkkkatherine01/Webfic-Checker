@@ -39,7 +39,7 @@ async def test_story01_ideal_extraction_finds_exactly_the_planted_issues(factory
     assert found == sorted(
         [
             (Confidence.SUSPECTED_REVIEW, (1, 3, 3)),  # 苏晚晴 19 → 25 with 2 years
-            (Confidence.SUSPECTED_REVIEW, (1, 4)),  # 白发老者 vs 30
+            # (白发老者 vs "年方三十" is not planted any more: "当年" makes it a past age, 4-3)
             (Confidence.CONFIRMED, (4, 5)),  # 林远 21 → 19
         ]
     ), [i.description for i in report.issues]

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 class Tier(StrEnum):
     EXTRACT = "extract"  # cheap model: extraction, consolidation
     REASON = "reason"  # stronger model: semantic checkers
+    VERIFY = "verify"  # the verify agent (step 4-3: flash without thinking did as well as v4-pro)
 
 
 @dataclass

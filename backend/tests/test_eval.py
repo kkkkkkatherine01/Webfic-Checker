@@ -266,5 +266,5 @@ async def test_runner_with_ideal_extraction_scores_perfectly(tmp_path):
     fresh = await run_story(story, Settings(), make_client, cache, samples=2, fresh=True)
     assert len(backend.calls) == 15
     assert aggregate_story(story.id, 1, fresh).issue_hits == {
-        "story01/su-age-jump": 2, "story01/zhao-elderly-vs-30": 2, "story01/lin-age-backwards": 2,
+        "story01/su-age-jump": 2, "story01/lin-age-backwards": 2,
     }  # fmt: skip

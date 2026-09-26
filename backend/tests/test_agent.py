@@ -203,7 +203,7 @@ async def test_a_reply_without_tool_calls_gets_a_nudge(factory):
     book_id = await book(factory)
     result, backend = await run(factory, book_id, ["我想想。", LOOK, ANSWER])
     assert result.status == "done" and result.spend.turns == 3
-    assert backend.calls[1][-1].role == "user" and "answer" in backend.calls[1][-1].content
+    assert backend.calls[1][-2].role == "user" and "answer" in backend.calls[1][-2].content
 
 
 async def test_the_guard_sends_an_answer_back_until_it_holds(factory):
@@ -307,3 +307,46 @@ def test_the_trace_command_prints_a_run(tmp_path, monkeypatch):
     assert (
         "list_facts" in output.output and "林远十八岁" in output.output and "完成" in output.output
     )
+
+
+# --- working memory (step 4-3) --------------------------------------------------------------
+
+
+async def test_old_tool_results_are_folded_and_the_model_sees_its_progress(factory):
+    book_id = await book(factory)
+    result, backend = await run(factory, book_id, [LOOK, LOOK, LOOK, ANSWER],
+                                budget=Budget(max_turns=5))  # fmt: skip
+    assert result.status == "done"
+    # The 4th request: turn 1's result is folded, turns 2 and 3 are whole.
+    replies = tool_replies(backend, 3)
+    assert replies[0].startswith("〔已折叠：list_facts") and "需要时可以重新调用" in replies[0]
+    assert all("林远今年十八岁" in r for r in replies[1:])
+    # From the 2nd request on, a progress note; near the end, a push to conclude.
+    assert backend.calls[0][-1].role == "user" and "进度" not in backend.calls[0][-1].content
+    assert backend.calls[1][-1].content.startswith("〔进度：已用 1/5 轮")
+    assert "剩余轮数不多" in backend.calls[3][-1].content
+    # The record keeps what was folded; the conversation itself is not rewritten.
+    llm_steps = [s for s in await steps(factory, result.run_id) if s.kind == "llm"]
+    assert [s.input["folded"] for s in llm_steps] == [0, 0, 0, 1]
+
+
+async def test_folding_can_be_turned_off(factory):
+    book_id = await book(factory)
+    backend = ScriptedBackend([LOOK, LOOK, LOOK, ANSWER])
+    await run_agent(
+        agent_llm(backend), agent="test", system="s", task="t", tools=registry(),
+        context=ToolContext(factory=factory, user_id=USER, book_id=book_id),
+        trace=TraceWriter(factory, user_id=USER, book_id=book_id),
+        keep_turns=None, progress_note=False,
+    )  # fmt: skip
+    assert all("已折叠" not in m.content for m in backend.calls[3])
+    assert backend.calls[3][-1].role == "tool"
+
+
+async def test_one_oversized_request_ends_the_run(factory):
+    book_id = await book(factory)
+    result, backend = await run(
+        factory, book_id, [LOOK] * 3, budget=Budget(max_turn_input_tokens=1000)
+    )
+    assert result.status == "budget_exhausted" and len(backend.calls) == 1
+    assert "单轮输入" in result.error

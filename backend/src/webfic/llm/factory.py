@@ -31,5 +31,10 @@ def platform_client(settings: Settings, store: CallStore | None = None) -> LLMCl
             settings.llm_reason_extra,
             settings.llm_reason_temperature,
         ),
+        Tier.VERIFY: TierConfig(
+            settings.llm_verify_model,
+            settings.llm_verify_extra,
+            settings.llm_verify_temperature,
+        ),
     }
     return JsonLLMClient(backend, tiers, store=store, max_retries=settings.llm_max_retries)

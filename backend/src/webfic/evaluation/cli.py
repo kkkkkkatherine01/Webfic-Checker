@@ -5,6 +5,7 @@ import hashlib
 import subprocess
 from collections import Counter
 from datetime import datetime
+from itertools import zip_longest
 from pathlib import Path
 from typing import Annotated
 
@@ -693,6 +694,310 @@ def retrieval(
     runs_dir.mkdir(parents=True, exist_ok=True)
     path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-retrieval-{label}.json"
     path.write_text(report.model_dump_json(indent=2), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+
+
+# --- verify agent (step 4-3) ------------------------------------------------------------
+
+
+@app.command("verify")
+def verify_cmd(
+    sets: Annotated[
+        str, typer.Option(help="keep（真矛盾）、synthetic（合成误报）、real（真实报告，保留集）")
+    ] = "keep,synthetic",
+    injected: Annotated[int, typer.Option(help="keep 集里注入的真矛盾条数")] = 40,
+    per_type: Annotated[int, typer.Option(help="合成误报每种类型的条数")] = 15,
+    samples: Annotated[int, typer.Option(min=1, help="每条运行次数；>1 时自动绕过缓存")] = 1,
+    fresh: Annotated[bool, typer.Option(help="绕过缓存，真实调用模型")] = False,
+    model: Annotated[str | None, typer.Option(help="覆盖校验 agent（verify 档）的模型")] = None,
+    extra: Annotated[
+        str | None,
+        typer.Option(
+            help='覆盖 verify 档的额外参数（JSON），如 {"thinking": {"type": "disabled"}}'
+        ),
+    ] = None,
+    replan: Annotated[bool, typer.Option(help="重新生成评估用的问题集合")] = False,
+    corpus: Annotated[
+        str,
+        typer.Option(
+            help="normal：原底稿；long：每 3 章合并的长章节底稿（webfic-eval long-chapters）"
+        ),
+    ] = "normal",
+    prompt: Annotated[
+        str | None, typer.Option(help="校验 agent 的 prompt 版本（默认当前版本）")
+    ] = None,
+    concurrency: Annotated[int, typer.Option(min=1, help="同时处理的作品数")] = 4,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "verify",
+    baseline: Annotated[bool, typer.Option(help="同时保存为 eval/verify-baseline.json")] = False,
+) -> None:
+    """校验 agent 评估（4-3）：真矛盾不能误杀、合成误报要驳回、真实报告（保留集）。"""
+    import json
+
+    from rich.markup import escape
+
+    from webfic.agent.verify import PROMPT_VERSION
+    from webfic.archival.index import platform_archival
+    from webfic.db.session import make_engine, make_session_factory
+    from webfic.evaluation import inject as ij
+    from webfic.evaluation import verify_eval as ve
+    from webfic.extraction.extractor import extraction_version
+    from webfic.llm.cache import DbCallStore
+
+    wanted = {s.strip() for s in sets.split(",") if s.strip()}
+    if not wanted <= {"keep", "synthetic", "real"}:
+        raise typer.BadParameter(f"未知的集合：{sets}")
+    settings = get_settings()
+    overrides = {}
+    if model:
+        overrides["llm_verify_model"] = model
+    if extra is not None:
+        overrides["llm_verify_extra"] = json.loads(extra)
+    verify_settings = settings.model_copy(update=overrides)
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    if corpus not in ("normal", "long"):
+        raise typer.BadParameter("corpus 只能是 normal 或 long")
+    plan_path = EVAL_DIR / ("verify-plan-long.json" if corpus == "long" else "verify-plan.json")
+
+    async def main():
+        engine = make_engine(settings.database_url)
+        factory = make_session_factory(engine)
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+        archival = platform_archival(settings)
+        try:
+            if plan_path.exists() and not replan:
+                plan = [ve.Case.model_validate(c) for c in json.loads(plan_path.read_text("utf-8"))]
+                console.print(f"沿用问题集合 {plan_path.name}（{len(plan)} 条；--replan 重新生成）")
+            else:
+                version = extraction_version(
+                    load_prompt(), settings.chunk_size, settings.chunk_overlap
+                )
+                async with factory() as session:
+                    books = await ve._books(session, ij.INJECT_USER, "@" + version[:8])
+                long = corpus == "long"
+                books = {n: b for n, b in books.items() if n.startswith("long/") == long}
+                if not books:
+                    raise typer.BadParameter(
+                        "找不到底稿，请先运行 webfic-eval long-chapters"
+                        if long
+                        else "找不到注入评估的底稿，请先运行 webfic-eval inject --prepare-only"
+                    )
+                plan = [] if long else await ve.golden_cases(factory, EVAL_DIR / "golden")
+                plan += await ve.injected_cases(factory, books, 400)
+                plan += await ve.synthetic_cases(factory, books, 40, on_progress=console.print)
+                plan_path.write_text(
+                    json.dumps(
+                        [c.model_dump(mode="json") for c in plan], ensure_ascii=False, indent=1
+                    ),
+                    "utf-8",
+                )
+                console.print(f"问题集合已保存：{plan_path.name}（{len(plan)} 条）")
+            chosen: list[ve.Case] = []
+            if "keep" in wanted:
+                chosen += [c for c in plan if c.kind.startswith("golden") and c.set == "keep"]
+                # Round-robin over the injection kinds (the plan lists them kind by kind).
+                by_kind: dict[str, list[ve.Case]] = {}
+                for c in plan:
+                    if c.kind.startswith("injected:"):
+                        by_kind.setdefault(c.kind, []).append(c)
+                mixed = [c for group in zip_longest(*by_kind.values()) for c in group if c]
+                chosen += mixed[:injected]
+            if "synthetic" in wanted:
+                chosen += [c for c in plan if c.kind == "golden:false_alarm"]
+                for kind in ve.CORRUPTIONS:
+                    chosen += [c for c in plan if c.kind == f"synthetic:{kind}"][:per_type]
+            if "real" in wanted:  # from the labels file every time, so corrections apply
+                real = await ve.real_cases(factory, ve.load_labels(EVAL_DIR))
+                if not real:
+                    raise typer.BadParameter("没有真实报告的标注：eval/external/inject/labels.yaml")
+                chosen += real
+            await ve.index_books(factory, archival, chosen, console.print)
+
+            new_samples = fresh or samples > 1
+
+            def make_llms(case):
+                def store(fresh_calls):
+                    return _LayeredStore(
+                        DbCallStore(factory, user_id=case.user_id, book_id=case.book_id),
+                        DbCallStore(cache, user_id=None),
+                        fresh=fresh_calls,
+                    )
+
+                return (
+                    platform_client(settings, store(False)),  # the set-up: text edits re-read
+                    platform_client(verify_settings, store(new_samples)),
+                )
+
+            count = {"done": 0}
+            total = len(chosen) * samples
+
+            def done(result) -> None:
+                count["done"] += 1
+                if count["done"] % 10 == 0:
+                    console.print(f"  [{count['done']}/{total}]")
+
+            console.print(
+                f"核实 {len(chosen)} 条 × {samples} 次，模型 {verify_settings.llm_verify_model}"
+                f" {json.dumps(verify_settings.llm_verify_extra, ensure_ascii=False)}"
+            )
+            results = await ve.run_all(
+                chosen, samples=samples, factory=factory, make_llms=make_llms,
+                settings=verify_settings, archival=archival, concurrency=concurrency,
+                on_done=done, prompt_version=prompt,
+            )  # fmt: skip
+            return results
+        finally:
+            await engine.dispose()
+
+    results = asyncio.run(main())
+    scores = ve.score(results)
+    table = Table(
+        "集合", "条数", "次数", "未复现", "正确", "判为误报", "需作者确认", "未完成", "原因对",
+        "稳定", "轮数", "工具调用", "每次 $", title="校验 agent 评估",
+    )  # fmt: skip
+    for s in scores:
+        table.add_row(
+            s.set, str(s.cases), str(s.runs), str(s.not_set_up), str(s.right), str(s.dismissed),
+            str(s.needs_author), str(s.unfinished), str(s.reason_right), str(s.stable),
+            f"{s.turns:.1f}", f"{s.tool_calls:.1f}", f"{s.cost_per_run:.4f}",
+        )  # fmt: skip
+    console.print(table)
+    for s in scores:
+        console.print(
+            f"[bold]{s.set}[/] 按类型：" + "、".join(f"{k} {v}" for k, v in s.by_kind.items())
+        )
+    wrong = [r for r in results if r.set_up and not r.right]
+    if wrong:
+        console.print("\n[bold]结论不对的[/]")
+        for r in wrong:
+            expected = "/".join(r.case.expect)
+            run = str(r.run_id)[:8] if r.run_id else ""
+            console.print(
+                f"  {r.case.id}（{r.case.kind}，期望 {expected}）→ {r.verdict} {r.reason}"
+                f"  [dim]{run}[/]\n    {escape(r.explanation or '')}"
+            )
+    report = {
+        "label": label,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "model": verify_settings.llm_verify_model,
+        "extra": verify_settings.llm_verify_extra,
+        "prompt": prompt or PROMPT_VERSION,
+        "samples": samples,
+        "fresh": fresh or samples > 1,
+        "scores": [s.model_dump(mode="json") for s in scores],
+        "results": [r.model_dump(mode="json") for r in results],
+    }
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = runs_dir / f"{stamp}-verify-{label}.json"
+    text = json.dumps(report, ensure_ascii=False, indent=1)
+    path.write_text(text, "utf-8")
+    console.print(f"\n结果已保存：{path}")
+    if baseline:
+        (EVAL_DIR / "verify-baseline.json").write_text(text, "utf-8")
+        console.print(f"已保存为基线：{EVAL_DIR / 'verify-baseline.json'}")
+
+
+@app.command("long-chapters")
+def long_chapters_cmd(
+    count: Annotated[int, typer.Option(help="用多少部 WebNovelBench（每 3 章合并成 1 章）")] = 20,
+    concurrency: Annotated[int, typer.Option(min=1, help="同时处理的作品数")] = 6,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "long-chapters",
+) -> None:
+    """长章节（4-3）：导入合并后的长章节底稿，并与原章节的抽取结果对比。"""
+    import json
+
+    from webfic.db.session import make_engine, make_session_factory
+    from webfic.evaluation import inject as ij
+    from webfic.evaluation import long_chapters as lc
+    from webfic.evaluation import verify_eval as ve
+    from webfic.extraction.extractor import extraction_version
+    from webfic.llm.cache import DbCallStore
+
+    settings = get_settings()
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    longs = lc.long_bases(EVAL_DIR / "external", count)
+
+    async def main():
+        engine = make_engine(settings.database_url)
+        factory = make_session_factory(engine)
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+
+        def make_llm(book_id):
+            store = _LayeredStore(
+                DbCallStore(factory, user_id=ij.INJECT_USER, book_id=book_id),
+                DbCallStore(cache, user_id=None),
+            )
+            return platform_client(settings, store)
+
+        try:
+            prepared = await ij.prepare(
+                factory, make_llm, settings, [lg.base for lg in longs], concurrency=concurrency,
+                on_progress=console.print,
+            )  # fmt: skip
+            version = extraction_version(load_prompt(), settings.chunk_size, settings.chunk_overlap)
+            async with factory() as session:
+                originals = await ve._books(session, ij.INJECT_USER, "@" + version[:8])
+            return [
+                await lc.compare(factory, lg, prepared[lg.base.name], originals[lg.original])
+                for lg in longs
+            ]
+        finally:
+            await engine.dispose()
+
+    rows = asyncio.run(main())
+    table = Table(
+        "作品", "长章字数", "原章抽到", "长章抽到", "共同", "标注一致", title="长章节抽取对比"
+    )
+    for r in rows:
+        table.add_row(
+            r.name, "、".join(str(c) for c in r.long_chapter_chars), str(r.original), str(r.long),
+            str(r.both), str(r.same_reading),
+        )  # fmt: skip
+    total = {
+        k: sum(getattr(r, k) for r in rows) for k in ("original", "long", "both", "same_reading")
+    }
+    table.add_row(
+        "全部", "", str(total["original"]), str(total["long"]), str(total["both"]),
+        str(total["same_reading"]),
+    )  # fmt: skip
+    console.print(table)
+    kept = Ratio(num=total["both"], den=total["original"])
+    extra = Ratio(num=total["long"] - total["both"], den=total["long"])
+    agree = Ratio(num=total["same_reading"], den=total["both"])
+    console.print(
+        f"原章抽到的年龄，长章也抽到：{kept}；长章多出来的：{extra}；"
+        f"两边都抽到的，标注完全一致：{agree}"
+    )
+    ages = {
+        k: sum(getattr(r, k) for r in rows)
+        for k in ("original_ages", "long_ages", "both_ages", "same_ages")
+    }
+    console.print(
+        f"只看写明数字的年龄（不含「少年」「老者」这类人生阶段）：原章 {ages['original_ages']}、"
+        f"长章 {ages['long_ages']}；原章的长章也抽到 "
+        f"{Ratio(num=ages['both_ages'], den=ages['original_ages'])}；长章多出来的 "
+        f"{Ratio(num=ages['long_ages'] - ages['both_ages'], den=ages['long_ages'])}；"
+        f"标注一致 {Ratio(num=ages['same_ages'], den=ages['both_ages'])}"
+    )
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{label}.json"
+    path.write_text(
+        json.dumps(
+            {"label": label, "rows": [r.model_dump() for r in rows], "totals": total},
+            ensure_ascii=False, indent=1,
+        ),
+        "utf-8",
+    )  # fmt: skip
     console.print(f"\n结果已保存：{path}")
 
 

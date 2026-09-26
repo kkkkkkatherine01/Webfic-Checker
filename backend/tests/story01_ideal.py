@@ -68,7 +68,8 @@ IDEAL = {
     },
     4: {
         "age_statements": [
-            a("赵无极", "赵无极", "年方三十的赵无极", 30),
+            # "当年一人一剑": the age back then, how long ago not stated (relabelled in 4-3)
+            a("赵无极", "赵无极", "年方三十的赵无极", 30, flashback=True),
             a("他", "林远", "他今年二十一岁", 21),
         ],
         "elapsed_time_statements": [elapsed("不知不觉又过了一年", 1)],

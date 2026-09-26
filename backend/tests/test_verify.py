@@ -240,3 +240,19 @@ def test_no_test_or_real_text_leaks_into_the_prompt():
         if f in path.read_text("utf-8-sig", errors="ignore")
     ]
     assert leaks == []
+
+
+# --- reading limits (step 4-3) --------------------------------------------------------------
+
+
+async def test_reads_are_capped_and_a_reversed_range_is_refused(world, monkeypatch):
+    from webfic.agent import verify as v
+
+    with pytest.raises(ValueError, match="end 不能小于 start"):
+        v.ReadPassageArgs(chapter=3, start=5, end=2)
+    monkeypatch.setattr(v, "MAX_SPAN", 3)
+    monkeypatch.setattr(v, "MAX_READ", 5)
+    text = await v.read_passage(context(world), v.ReadPassageArgs(chapter=3, start=0, end=7))
+    assert "只返回前 3 字" in text and "【林远今】" in text
+    with pytest.raises(ValueError):
+        v.SearchTextArgs(query="林远", k=6)

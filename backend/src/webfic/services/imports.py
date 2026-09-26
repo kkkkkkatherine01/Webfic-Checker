@@ -10,10 +10,10 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from webfic.archival.index import Archival, index_chapter
+from webfic.archival.index import Archival, index_chapter, retokenize_for_names
 from webfic.config import Settings
 from webfic.db.models import (
     Book,
@@ -38,7 +38,7 @@ from webfic.ingest.splitter import split_chapters
 from webfic.llm.base import LLMClient, LLMError, ProviderError, ProviderErrorKind
 from webfic.memory import core, events
 from webfic.memory.events import EventKind
-from webfic.services.errors import NotFound
+from webfic.services.errors import InvalidEdit, NotFound
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +73,11 @@ class ImportJobResult(BaseModel):
     llm_calls: int
     cache_hits: int
     reused: int = 0  # chapters whose stored extraction was reused (no model call)
+    # A chapter that had failed was followed by extracted ones, so everything from it on
+    # was recomputed in order (see run_import_job).
+    recomputed_from: int | None = None
+    # With `from_chapter`: earlier chapters that are still not extracted (left alone).
+    left_failed: list[int] = []
     input_tokens: int
     output_tokens: int
     cost_usd: Decimal
@@ -85,6 +90,8 @@ async def create_import_job(
     session: AsyncSession, *, user_id: uuid.UUID, title: str, text: str
 ) -> ImportJobCreated:
     split = split_chapters(text)
+    if not split.chapters:
+        raise InvalidEdit("没有可导入的正文")
     book = Book(user_id=user_id, title=title)
     session.add(book)
     await session.flush()
@@ -139,6 +146,49 @@ async def _load_character_index(
     )
 
 
+async def reset_from(
+    session: AsyncSession, *, user_id: uuid.UUID, book_id: uuid.UUID, number: int
+) -> None:
+    """Forget everything derived from chapters `number`..: character changes, facts,
+    Core snapshots. The chapters themselves, their stored extractions and their passages
+    are left in place (unchanged chapters reuse them)."""
+    await events.undo_from_chapter(session, user_id=user_id, book_id=book_id, chapter_number=number)
+    for model in (FactRow, ElapsedTimeFactRow):
+        await session.execute(
+            delete(model).where(
+                model.user_id == user_id, model.book_id == book_id, model.chapter_number >= number
+            )
+        )
+    await core.restore(session, user_id=user_id, book_id=book_id, chapter_number=number)
+
+
+async def mark_pending(
+    session: AsyncSession, *, user_id: uuid.UUID, book_id: uuid.UUID, number: int
+) -> None:
+    await session.execute(
+        update(Chapter)
+        .where(Chapter.user_id == user_id, Chapter.book_id == book_id, Chapter.number >= number)
+        .values(status="pending", error=None)
+    )
+
+
+async def _index(
+    session: AsyncSession,
+    archival: Archival,
+    user_id: uuid.UUID,
+    book_id: uuid.UUID,
+    chapter: Chapter,
+    index: CharacterIndex,
+) -> None:
+    await index_chapter(
+        session, archival, user_id=user_id, book_id=book_id, chapter=chapter, names=_names(index)
+    )
+
+
+def _names(index: CharacterIndex) -> list[str]:
+    return [n for c in index.characters() for n in (c.canonical_name, *c.aliases)]
+
+
 async def _emit(on_progress: ProgressCallback | None, event: ProgressEvent) -> None:
     if on_progress is None:
         return
@@ -156,22 +206,58 @@ async def run_import_job(
     book_id: uuid.UUID,
     on_progress: ProgressCallback | None = None,
     archival: Archival | None = None,
+    from_chapter: int | None = None,
 ) -> ImportJobResult:
     """Extract every chapter that is not yet `extracted`, in narrative order. Each chapter
     commits on its own, so an interrupted run can simply be started again. With
-    `archival`, each chapter's passages are indexed for search in the same transaction."""
+    `archival`, each chapter's passages are indexed for search in the same transaction.
+
+    Chapters must be processed in order: each one's Core snapshot builds on the previous
+    one and its extraction sees the characters known so far. So when a chapter that had
+    failed is followed by extracted ones, everything from it on is recomputed (unchanged
+    chapters reuse their stored extraction, so only the failed one costs a model call).
+    With `from_chapter` (chapter management, which has already reset from there), only
+    chapters from that one on are processed; earlier failed ones are left as they are."""
+    recomputed_from: int | None = None
+    left_failed: list[int] = []
     async with session_factory() as session:
         book = await session.scalar(select(Book).where(Book.id == book_id, Book.user_id == user_id))
         if book is None:
             raise NotFound(f"book {book_id}")
-        todo = (
-            await session.execute(
-                select(Chapter.id, Chapter.number, Chapter.title)
+        not_extracted = (
+            Chapter.user_id == user_id,
+            Chapter.book_id == book_id,
+            Chapter.status != "extracted",
+        )
+        if from_chapter is not None:
+            left_failed = list(
+                await session.scalars(
+                    select(Chapter.number)
+                    .where(*not_extracted, Chapter.number < from_chapter)
+                    .order_by(Chapter.number)
+                )
+            )
+        else:
+            first = await session.scalar(select(func.min(Chapter.number)).where(*not_extracted))
+            later_done = first is not None and await session.scalar(
+                select(Chapter.id)
                 .where(
                     Chapter.user_id == user_id,
                     Chapter.book_id == book_id,
-                    Chapter.status != "extracted",
+                    Chapter.status == "extracted",
+                    Chapter.number > first,
                 )
+                .limit(1)
+            )
+            if first is not None and later_done:
+                await reset_from(session, user_id=user_id, book_id=book_id, number=first)
+                await mark_pending(session, user_id=user_id, book_id=book_id, number=first)
+                await session.commit()
+                recomputed_from = first
+        todo = (
+            await session.execute(
+                select(Chapter.id, Chapter.number, Chapter.title)
+                .where(*not_extracted, Chapter.number >= (from_chapter or 0))
                 .order_by(Chapter.number)
             )
         ).all()
@@ -181,6 +267,7 @@ async def run_import_job(
     result = ImportJobResult(
         extracted=0, failed=0, dropped_statements=0, llm_calls=0, cache_hits=0,
         input_tokens=0, output_tokens=0, cost_usd=Decimal(0),
+        recomputed_from=recomputed_from, left_failed=left_failed,
     )  # fmt: skip
 
     for done, (chapter_id, number, title) in enumerate(todo, start=1):
@@ -190,7 +277,10 @@ async def run_import_job(
             # An unchanged chapter keeps its earlier reading: asking the model again gives
             # a slightly different one, which would blur what an edit really changed.
             stored = await session.scalar(
-                select(ChapterExtractionRow).where(ChapterExtractionRow.chapter_id == chapter_id)
+                select(ChapterExtractionRow).where(
+                    ChapterExtractionRow.user_id == user_id,
+                    ChapterExtractionRow.chapter_id == chapter_id,
+                )
             )
             try:
                 if (
@@ -225,6 +315,10 @@ async def run_import_job(
                     raise  # a bad or unfunded key fails every chapter; stop here
                 kind = exc.kind if isinstance(exc, ProviderError) else "invalid_output"
                 chapter.status, chapter.error = "failed", str(exc)[:2000]
+                if archival is not None:
+                    # Indexing is local work: the text stays searchable, and a replaced
+                    # chapter never keeps its old passages, whatever the provider says.
+                    await _index(session, archival, user_id, book_id, chapter, index)
                 await session.commit()
                 result.failed += 1
                 result.failures[kind] = result.failures.get(kind, 0) + 1
@@ -236,7 +330,9 @@ async def run_import_job(
 
             # Re-running a chapter replaces its earlier facts.
             for model in (FactRow, ElapsedTimeFactRow):
-                await session.execute(delete(model).where(model.chapter_id == chapter_id))
+                await session.execute(
+                    delete(model).where(model.user_id == user_id, model.chapter_id == chapter_id)
+                )
 
             # Real names revealed in this chapter first, so statements using them resolve
             # to the right (renamed or merged) character.
@@ -282,7 +378,7 @@ async def run_import_job(
             for rename in index.renames:
                 await session.execute(
                     update(Character)
-                    .where(Character.id == rename.character_id)
+                    .where(Character.user_id == user_id, Character.id == rename.character_id)
                     .values(canonical_name=rename.new_name)
                 )
                 changes.append((EventKind.RENAME, {
@@ -297,18 +393,27 @@ async def run_import_job(
                 moved: dict[str, list[str]] = {}
                 for model, key in ((FactRow, "fact_ids"), (CharacterAlias, "alias_ids")):
                     ids = await session.scalars(
-                        select(model.id).where(model.character_id == merge.from_id)
+                        select(model.id).where(
+                            model.user_id == user_id, model.character_id == merge.from_id
+                        )
                     )
                     moved[key] = [str(i) for i in ids]
                     await session.execute(
                         update(model)
-                        .where(model.character_id == merge.from_id)
+                        .where(model.user_id == user_id, model.character_id == merge.from_id)
                         .values(character_id=merge.into_id)
                     )
                 await session.execute(
-                    delete(CharacterStateRow).where(CharacterStateRow.character_id == merge.from_id)
+                    delete(CharacterStateRow).where(
+                        CharacterStateRow.user_id == user_id,
+                        CharacterStateRow.character_id == merge.from_id,
+                    )
                 )
-                await session.execute(delete(Character).where(Character.id == merge.from_id))
+                await session.execute(
+                    delete(Character).where(
+                        Character.user_id == user_id, Character.id == merge.from_id
+                    )
+                )
                 changes.append((EventKind.MERGE, {
                     "from_id": str(merge.from_id), "from_name": merge.from_name,
                     "into_id": str(merge.into_id), **moved,
@@ -356,10 +461,17 @@ async def run_import_job(
                 session, user_id=user_id, book_id=book_id, chapter_id=chapter_id, state=state
             )
             if archival is not None:
-                names = [n for c in index.characters() for n in (c.canonical_name, *c.aliases)]
-                await index_chapter(
-                    session, archival, user_id=user_id, book_id=book_id, chapter=chapter,
-                    names=names,
+                await _index(session, archival, user_id, book_id, chapter, index)
+                # Names first known in this chapter were cut into pieces in passages
+                # indexed before; re-cut those passages so keyword search finds them.
+                new_names = [
+                    *(c.canonical_name for c in index.new_characters),
+                    *(r.new_name for r in index.renames),
+                    *(a.alias for a in index.new_aliases),
+                ]
+                await retokenize_for_names(
+                    session, archival, user_id=user_id, book_id=book_id,
+                    new_names=new_names, names=_names(index),
                 )  # fmt: skip
 
             chapter.status, chapter.error = "extracted", None

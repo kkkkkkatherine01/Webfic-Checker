@@ -10,8 +10,15 @@ from tests import fakes
 from tests.fakes import FakeBackend
 from webfic.checkers.types import Confidence, IssueStatus
 from webfic.config import Settings
-from webfic.db.models import Chapter, Character, CharacterAlias, FactRow, IssueRow
-from webfic.services import checks, imports, reports
+from webfic.db.models import (
+    Chapter,
+    Character,
+    CharacterAlias,
+    CoreSnapshot,
+    FactRow,
+    IssueRow,
+)
+from webfic.services import chapters, checks, imports, reports
 
 USER = uuid.uuid4()
 OTHER_USER = uuid.uuid4()
@@ -190,11 +197,60 @@ async def test_failed_chapter_is_marked_and_resumable(factory):
     assert (result.extracted, result.failed) == (2, 1)
     assert events[1].status == "failed"
 
+    backend = FakeBackend(respond)
     resumed = await imports.run_import_job(
-        factory, make_llm(FakeBackend(respond), factory, job.book_id), Settings(),
+        factory, make_llm(backend, factory, job.book_id), Settings(),
         user_id=USER, book_id=job.book_id,
     )  # fmt: skip
-    assert (resumed.extracted, resumed.failed) == (1, 0)
+    # Chapter 3 was extracted after the failed chapter 2, so both are recomputed in order;
+    # chapter 3 reuses its stored extraction and only chapter 2 asks the model.
+    assert (resumed.extracted, resumed.failed, resumed.reused) == (2, 0, 1)
+    assert resumed.recomputed_from == 2
+    assert len(backend.calls) == 1
+
+    # The result is the same as an import in which nothing failed.
+    reference, _, _ = await import_book(factory, FakeBackend(respond))
+
+    async def summary(book_id):
+        async with factory() as session:
+            snapshots = (
+                await session.execute(
+                    select(CoreSnapshot.chapter_number, CoreSnapshot.state)
+                    .where(CoreSnapshot.book_id == book_id)
+                    .order_by(CoreSnapshot.chapter_number)
+                )
+            ).all()
+            facts = (
+                await session.execute(
+                    select(FactRow.chapter_number, FactRow.raw_text, Character.canonical_name)
+                    .join(Character, Character.id == FactRow.character_id)
+                    .where(FactRow.book_id == book_id)
+                    .order_by(FactRow.chapter_number, FactRow.char_start)
+                )
+            ).all()
+        ages = [
+            (n, sorted((c["canonical_name"], c["age_low"], c["age_chapter"])
+                       for c in state["characters"].values()))
+            for n, state in snapshots
+        ]  # fmt: skip
+        return ages, [tuple(f) for f in facts]
+
+    assert await summary(job.book_id) == await summary(reference.book_id)
+
+
+async def test_chapter_operations_leave_earlier_failed_chapters_alone(factory):
+    def flaky(messages):
+        return "garbage" if "第 2 章" in messages[1].content else respond(messages)
+
+    job, result, _ = await import_book(factory, FakeBackend(flaky))
+    assert result.failed == 1
+    backend = FakeBackend(flaky)
+    change = await chapters.replace_chapter(
+        factory, make_llm(backend, factory, job.book_id), Settings(), user_id=USER,
+        book_id=job.book_id, number=3, content="十六岁的林远摸了摸新伤。",
+    )  # fmt: skip
+    assert len(backend.calls) == 1  # chapter 3 only; the failed chapter 2 is not retried
+    assert any("第 2 章" in w and "resume" in w for w in change.warnings)
 
 
 async def test_other_users_cannot_see_the_book(factory):

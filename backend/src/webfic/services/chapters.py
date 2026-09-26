@@ -3,8 +3,8 @@
 Web novels are serialised, so appending is the common case; replacing, deleting and
 patching share "recompute from chapter N": undo the character changes of chapters N..,
 drop their facts, roll the Core back to chapter N-1, extract N.. again (unchanged chapters
-hit the LLM cache and cost nothing) and re-run the checks, which keep the author's status
-on issues through their content-based fingerprints.
+reuse their stored extraction and cost nothing) and re-run the checks, which keep the
+author's status on issues through their content-based fingerprints.
 
 Nothing here assumes the edit comes from the author: the revision agent of step 8 will
 use the same services. Every operation can run as a dry run, which reports the issues it
@@ -28,15 +28,12 @@ from webfic.db.models import (
     Book,
     Chapter,
     ChapterExtractionRow,
-    ElapsedTimeFactRow,
-    FactRow,
     IssueRow,
     PassageRow,
 )
 from webfic.db.session import rolled_back
 from webfic.ingest.splitter import normalize_newlines, split_chapters
 from webfic.llm.base import LLMClient
-from webfic.memory import core, events
 from webfic.services import checks, imports
 from webfic.services.errors import InvalidEdit, NotFound
 from webfic.services.reports import IssueView, issue_view, sort_issues
@@ -94,38 +91,14 @@ async def _open_issues(
     return {row.fingerprint: issue_view(row) for row in rows}
 
 
-async def _reset_from(
-    session: AsyncSession, user_id: uuid.UUID, book_id: uuid.UUID, number: int
-) -> None:
-    """Forget everything derived from chapters `number`..: character changes, facts,
-    Core snapshots. The chapters themselves are left in place."""
-    await events.undo_from_chapter(session, user_id=user_id, book_id=book_id, chapter_number=number)
-    for model in (FactRow, ElapsedTimeFactRow):
-        await session.execute(
-            delete(model).where(
-                model.user_id == user_id, model.book_id == book_id, model.chapter_number >= number
-            )
-        )
-    await core.restore(session, user_id=user_id, book_id=book_id, chapter_number=number)
-
-
-async def _mark_pending(
-    session: AsyncSession, user_id: uuid.UUID, book_id: uuid.UUID, number: int
-) -> None:
-    await session.execute(
-        update(Chapter)
-        .where(Chapter.user_id == user_id, Chapter.book_id == book_id, Chapter.number >= number)
-        .values(status="pending", error=None)
-    )
-
-
 def _set_content(chapter: Chapter, content: str) -> None:
     chapter.content = content
     chapter.char_count = len(content)
     chapter.content_hash = hashlib.sha256(content.encode()).hexdigest()
 
 
-Edit = Callable[[AsyncSession], Awaitable[list[str]]]  # changes the chapters; returns warnings
+# Changes the chapters; returns the first chapter to recompute and any warnings.
+Edit = Callable[[AsyncSession], Awaitable[tuple[int, list[str]]]]
 
 
 async def _apply(
@@ -146,12 +119,19 @@ async def _apply(
         async with scoped() as session:
             await _book(session, user_id, book_id)
             before = await _open_issues(session, user_id, book_id)
-            warnings = await edit(session)
+            first, warnings = await edit(session)
             await session.commit()
 
         extraction = await imports.run_import_job(
-            scoped, llm, settings, user_id=user_id, book_id=book_id, archival=archival
-        )
+            scoped, llm, settings, user_id=user_id, book_id=book_id, archival=archival,
+            from_chapter=first,
+        )  # fmt: skip
+        if extraction.left_failed:
+            listed = "、".join(str(n) for n in extraction.left_failed)
+            warnings = [
+                *warnings,
+                f"第 {listed} 章之前抽取失败，没有参与这次重算；可以用 resume 补跑。",
+            ]
         async with scoped() as session:
             await checks.run_checks(session, user_id=user_id, book_id=book_id)
             after = await _open_issues(session, user_id, book_id)
@@ -193,9 +173,11 @@ async def append_chapters(
     archival: Archival | None = None,
 ) -> ChangeResult:
     """Add one or more chapters (split like an import) after the last one."""
+    split = split_chapters(text)
+    if not split.chapters:
+        raise InvalidEdit("没有可追加的正文")
 
-    async def edit(session: AsyncSession) -> list[str]:
-        split = split_chapters(text)
+    async def edit(session: AsyncSession) -> tuple[int, list[str]]:
         last = await session.scalar(
             select(func.max(Chapter.number)).where(
                 Chapter.user_id == user_id, Chapter.book_id == book_id
@@ -208,7 +190,7 @@ async def append_chapters(
             )  # fmt: skip
             _set_content(chapter, raw.content)
             session.add(chapter)
-        return split.warnings
+        return (last or 0) + 1, split.warnings
 
     return await _apply(
         factory,
@@ -239,12 +221,12 @@ async def replace_chapter(
     if not content.strip():
         raise InvalidEdit("新内容为空；要删除这一章请用删除章节")
 
-    async def edit(session: AsyncSession) -> list[str]:
+    async def edit(session: AsyncSession) -> tuple[int, list[str]]:
         chapter = await _chapter(session, user_id, book_id, number)
-        await _reset_from(session, user_id, book_id, number)
+        await imports.reset_from(session, user_id=user_id, book_id=book_id, number=number)
         _set_content(chapter, content)
-        await _mark_pending(session, user_id, book_id, number)
-        return []
+        await imports.mark_pending(session, user_id=user_id, book_id=book_id, number=number)
+        return number, []
 
     return await _apply(
         factory,
@@ -271,12 +253,14 @@ async def delete_chapter(
 ) -> ChangeResult:
     """Delete chapter `number`; later chapters move up one number and are recomputed."""
 
-    async def edit(session: AsyncSession) -> list[str]:
+    async def edit(session: AsyncSession) -> tuple[int, list[str]]:
         chapter = await _chapter(session, user_id, book_id, number)
         # Undo first: the chapter's change log goes with the chapter row.
-        await _reset_from(session, user_id, book_id, number)
+        await imports.reset_from(session, user_id=user_id, book_id=book_id, number=number)
         for model in (ChapterExtractionRow, PassageRow):
-            await session.execute(delete(model).where(model.chapter_id == chapter.id))
+            await session.execute(
+                delete(model).where(model.user_id == user_id, model.chapter_id == chapter.id)
+            )
         await session.delete(chapter)
         await session.flush()
         later = (Chapter.user_id == user_id, Chapter.book_id == book_id, Chapter.number > number)
@@ -297,8 +281,8 @@ async def delete_chapter(
                 .scalar_subquery()
             )
         )
-        await _mark_pending(session, user_id, book_id, number)
-        return []
+        await imports.mark_pending(session, user_id=user_id, book_id=book_id, number=number)
+        return number, []
 
     return await _apply(
         factory,

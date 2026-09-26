@@ -55,6 +55,7 @@ class AgeFact:
     # Stable across re-extraction and chapter renumbering, unlike `id` and
     # `chapter_number`; None falls back to the chapter number.
     chapter_id: uuid.UUID | None = None
+    mention: str = ""  # how the text refers to the character here
 
     @property
     def pos(self) -> tuple[int, int]:
@@ -135,7 +136,15 @@ class _FactKeys:
     def __init__(self, facts: list[AgeFact]):
         seen: dict[tuple[str, str], int] = {}
         self._keys: dict[uuid.UUID, str] = {}
-        for f in sorted(facts, key=lambda f: f.pos):
+
+        # Facts at the same place (one quote giving an age and a life stage, or the ages of
+        # two people) are ordered by content too, never by the order the database returns
+        # them in, which changes after updates.
+        def order(f: AgeFact) -> tuple:
+            stage = f.life_stage.value if f.life_stage else ""
+            return (*f.pos, f.char_end, f.statement_type, f.mention, f.value or -1.0, stage)
+
+        for f in sorted(facts, key=order):
             chapter = str(f.chapter_id) if f.chapter_id else f"#{f.chapter_number}"
             n = seen.get((chapter, f.raw_text), 0)
             seen[(chapter, f.raw_text)] = n + 1

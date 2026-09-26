@@ -4,6 +4,7 @@ the source text, and merge the results of overlapping chunks."""
 import hashlib
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from importlib import resources
@@ -116,8 +117,12 @@ def build_user_message(
 # "再过三年", "至少还要五年", "若能…三年之内": markers of time that has not come yet. An
 # "advance" carrying one is a plan or a condition, not the story moving on. "N年后" alone
 # is not a marker: narration uses it for real jumps ("三年后，他回到了故乡").
+# "还有" and "至少" also occur in real advances ("三年过去了，他还有些不适应", "至少过去了
+# 五年"), so they count only as "还有 + a number of years / months" and not before "过去 /
+# 过了 / 已".
 _FUTURE_MARKER = re.compile(
-    r"再过|还要|还得|还有|至少|少说|打算|约定|约好|倘若|若是|若能|如果|要是|以内|之内"
+    r"再过|还要|还得|还有[^，。！？,!?]{0,4}?[年月]|(?:至少|少说)(?!也?(?:过去|过了|已))"
+    r"|打算|约定|约好|倘若|若是|若能|如果|要是|以内|之内"
 )
 
 # "迟来十八年的长眠", "守了三十年": a number of years is a duration, not an age. Ages are
@@ -170,7 +175,12 @@ async def extract_chapter(
 ) -> ChapterExtraction:
     result = ChapterExtraction()
     chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
-    seen_ages: set[tuple[int, int, str]] = set()
+    # A statement is sometimes listed twice, and chunks overlap, so one near a cut is
+    # read twice. Several characters can share one quote ("两人都是十八岁"), though: within
+    # a chunk, statements on one quote count once per person named; a later chunk adds
+    # only people beyond the most any earlier chunk had on that quote (it may name them
+    # differently, "他" for "林远", so names are not compared across chunks).
+    seen_ages: Counter[tuple[int, int, str]] = Counter()
     seen_elapsed: set[tuple[int, int]] = set()
 
     for chunk in chunks:
@@ -194,6 +204,7 @@ async def extract_chapter(
         # Models list statements in text order; searching after the previous hit of the
         # same quote keeps two identical quotes ("十八岁" twice) from collapsing into one.
         last_end: dict[str, int] = {}
+        in_chunk: dict[tuple[int, int, str], set[str]] = {}
 
         for s in extraction.age_statements:
             span = locate(chunk.text, s.raw_text, start_from=last_end.get(s.raw_text, 0))
@@ -204,11 +215,16 @@ async def extract_chapter(
                 continue
             start, end = span[0] + chunk.start, span[1] + chunk.start
             key = (start, end, s.statement_type)
-            if key in seen_ages:  # same statement seen again in the overlap region
+            people = in_chunk.setdefault(key, set())
+            person = (s.resolved_name or s.mention).strip()
+            if person in people:  # listed twice
                 continue
-            seen_ages.add(key)
+            people.add(person)
+            if len(people) <= seen_ages[key]:  # read already in the overlap region
+                continue
             result.ages.append(LocatedAge(_checked_offset(s, chunk.text), start, end))
 
+        seen_ages |= Counter({key: len(people) for key, people in in_chunk.items()})
         last_end.clear()
         for e in extraction.elapsed_time_statements:
             span = locate(chunk.text, e.raw_text, start_from=last_end.get(e.raw_text, 0))

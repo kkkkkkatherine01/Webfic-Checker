@@ -105,6 +105,11 @@ async def _extract(settings: Settings, factory: Factory, book_id: uuid.UUID) -> 
             archival=platform_archival(settings),
         )  # fmt: skip
 
+    if result.recomputed_from is not None:
+        console.print(
+            f"[yellow]第 {result.recomputed_from} 章之前没有抽取成功，已从这一章起按顺序重算"
+            "（原文未改的章节复用上次的抽取结果）。[/]"
+        )
     console.print(
         f"抽取完成：成功 {result.extracted} 章，失败 {result.failed} 章"
         f"{_failure_summary(result.failures)}；"
@@ -169,12 +174,17 @@ def ingest(
 
 
 @app.command()
-def resume(book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")]) -> None:
+def resume(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    check: Annotated[bool, typer.Option(help="抽取后立即运行检查")] = True,
+) -> None:
     """继续抽取未完成或失败的章节。"""
 
     async def main(settings: Settings, factory: Factory) -> None:
         book_id = await _resolve_book(factory, settings.dev_user_id, book)
         await _extract(settings, factory, book_id)
+        if check:
+            await _check(settings, factory, book_id)
 
     _run(main)
 
@@ -441,7 +451,7 @@ def reindex(book: Annotated[str, typer.Argument(help="作品 ID（可只写前�
             )
         console.print(
             f"共 {result.chapters} 章，重建 {result.rebuilt} 章、{result.passages} 段，"
-            f"耗时 {result.seconds} 秒。"
+            f"按角色名重新分词 {result.retokenized} 段，耗时 {result.seconds} 秒。"
         )
 
     _run(main)

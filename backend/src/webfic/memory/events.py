@@ -45,7 +45,9 @@ async def record(
     if not events:
         return
     last = await session.scalar(
-        select(func.max(CharacterEvent.seq)).where(CharacterEvent.book_id == book_id)
+        select(func.max(CharacterEvent.seq)).where(
+            CharacterEvent.user_id == user_id, CharacterEvent.book_id == book_id
+        )
     )
     for offset, (kind, payload) in enumerate(events, start=1):
         session.add(
@@ -95,7 +97,11 @@ async def _undo(
         case EventKind.CREATE:
             character_id = uuid.UUID(payload["character_id"])
             for model in (FactRow, CharacterAlias, CharacterStateRow):
-                await session.execute(delete(model).where(model.character_id == character_id))
+                await session.execute(
+                    delete(model).where(
+                        model.user_id == user_id, model.character_id == character_id
+                    )
+                )
             await session.execute(
                 delete(Character).where(
                     Character.id == character_id,

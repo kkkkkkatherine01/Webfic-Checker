@@ -628,8 +628,8 @@ def retrieval(
         [s for s in _load(golden_dir, None) if s.golden.retrieval] if "golden" in corpora else []
     )
     dqa_folder = EVAL_DIR / "external" / "detectiveqa"
-    dqa_questions, dqa_clues, skipped = (
-        rv.detectiveqa_questions(dqa_folder) if "detectiveqa" in corpora else ([], [], 0)
+    dqa_questions, dqa_clues, dqa_clues_any, skipped = (
+        rv.detectiveqa_questions(dqa_folder) if "detectiveqa" in corpora else ([], [], [], 0)
     )
 
     async def main() -> list[rv.Scores]:
@@ -663,6 +663,7 @@ def retrieval(
                     )
                     runs.append(("detectiveqa", books, dqa_questions))
                     runs.append(("detectiveqa-clues", books, dqa_clues))
+                    runs.append(("detectiveqa-clues-any", books, dqa_clues_any))
                 for name, books, questions in runs:
                     for mode in wanted_modes:
                         outcomes = await rv.evaluate(factory, archival, books, questions, mode)

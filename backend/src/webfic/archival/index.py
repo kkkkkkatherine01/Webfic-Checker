@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 
 from pydantic import BaseModel
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from webfic.archival.embedding import Embedder, FastEmbedder
@@ -81,18 +81,22 @@ async def index_chapter(
     key = archival.source_key(chapter)
     existing = set(
         await session.scalars(
-            select(PassageRow.source_key).where(PassageRow.chapter_id == chapter.id)
+            select(PassageRow.source_key).where(
+                PassageRow.user_id == user_id, PassageRow.chapter_id == chapter.id
+            )
         )
     )
     if existing == {key}:
         await session.execute(
             update(PassageRow)
-            .where(PassageRow.chapter_id == chapter.id)
+            .where(PassageRow.user_id == user_id, PassageRow.chapter_id == chapter.id)
             .values(chapter_number=chapter.number)
         )
         return 0
 
-    await session.execute(delete(PassageRow).where(PassageRow.chapter_id == chapter.id))
+    await session.execute(
+        delete(PassageRow).where(PassageRow.user_id == user_id, PassageRow.chapter_id == chapter.id)
+    )
     spans = split_passages(chapter.content, archival.passage_size, archival.passage_overlap)
     texts = [chapter.content[start:end] for start, end in spans]
     archival.tokenizer.add_names(names)
@@ -110,10 +114,52 @@ async def index_chapter(
     return len(spans)
 
 
+async def retokenize_for_names(
+    session: AsyncSession,
+    archival: Archival,
+    *,
+    user_id: uuid.UUID,
+    book_id: uuid.UUID,
+    new_names: list[str],
+    names: list[str],
+) -> int:
+    """Re-cut the keywords of the book's passages that contain a newly known name.
+
+    A name is added to the dictionary only once it is a character's name or alias, so
+    passages indexed earlier cut it into pieces ("宇智波鼬" -> "宇智波 / 鼬") and a keyword
+    search for the name would miss them. Only the tokens change; embeddings do not depend
+    on the dictionary. Returns how many passages were updated."""
+    wanted = sorted({n.strip() for n in new_names if len(n.strip()) >= 2})
+    if not wanted:
+        return 0
+    archival.tokenizer.add_names(names)
+    rows = (
+        await session.execute(
+            select(PassageRow.id, PassageRow.text, PassageRow.tokens).where(
+                PassageRow.user_id == user_id,
+                PassageRow.book_id == book_id,
+                or_(*(PassageRow.text.contains(n, autoescape=True) for n in wanted)),
+            )
+        )
+    ).all()
+    updated = 0
+    for passage_id, text, old in rows:
+        tokens = " ".join(archival.tokenizer.tokens(text))
+        if tokens != old:
+            await session.execute(
+                update(PassageRow)
+                .where(PassageRow.user_id == user_id, PassageRow.id == passage_id)
+                .values(tokens=tokens)
+            )
+            updated += 1
+    return updated
+
+
 class ReindexResult(BaseModel):
     chapters: int
     rebuilt: int  # chapters whose passages were (re)built
     passages: int  # passages built
+    retokenized: int = 0  # kept passages whose keywords were re-cut for today's names
     seconds: float
 
 
@@ -125,7 +171,8 @@ async def reindex_book(
     book_id: uuid.UUID,
 ) -> ReindexResult:
     """Make sure every chapter of the book has up-to-date passages (for books imported
-    before passages existed, or after changing the passage settings)."""
+    before passages existed, or after changing the passage settings), their keywords cut
+    with all of today's character names."""
     started = time.monotonic()
     async with factory() as session:
         owned = select(Book.id).where(Book.id == book_id, Book.user_id == user_id)
@@ -149,9 +196,15 @@ async def reindex_book(
             await session.commit()
         rebuilt += built > 0
         passages += built
+    async with factory() as session:
+        retokenized = await retokenize_for_names(
+            session, archival, user_id=user_id, book_id=book_id, new_names=names, names=names
+        )
+        await session.commit()
     return ReindexResult(
         chapters=len(chapter_ids),
         rebuilt=rebuilt,
         passages=passages,
+        retokenized=retokenized,
         seconds=round(time.monotonic() - started, 1),
     )

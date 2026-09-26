@@ -168,20 +168,27 @@ def paragraph_spans(path: Path) -> dict[int, Span]:
 _MIN_STATEMENT = 8  # shorter reasoning lines are not usable queries
 
 
-def detectiveqa_questions(folder: Path) -> tuple[list[Question], list[Question], int]:
-    """Two query sets over the same relevant passages (the clue paragraphs and the answer
-    paragraph; clues marked -1, reasoned rather than stated, and paragraphs outside chapter
-    text are left out):
+def detectiveqa_questions(
+    folder: Path,
+) -> tuple[list[Question], list[Question], list[Question], int]:
+    """Query sets over the annotated passages (clues marked -1, reasoned rather than
+    stated, and paragraphs outside chapter text are left out):
 
-    - "detectiveqa": the annotated questions ("文中案件的凶手是谁？"). Many need reasoning
-      over the whole book, which one search cannot do: a baseline for step 4's agent.
+    - "detectiveqa": the annotated questions ("文中案件的凶手是谁？"); relevant are all the
+      question's clue paragraphs and its answer paragraph. Many need reasoning over the
+      whole book, which one search cannot do: a baseline for step 4's agent.
     - "detectiveqa-clues": the annotators' one-line clue statements ("马歇尔太太让波洛
-      不要告诉别人她去哪儿"), i.e. concrete facts, like what an agent searches for. Some
+      不要告诉别人她去哪儿"), i.e. concrete facts, like what an agent searches for.
+      `reasoning[i]` states the clue at `clue_position[i]`, so each statement's relevant
+      passage is its own paragraph; statements of reasoned clues (-1) are left out. Some
       statements copy the text nearly word for word, so this set is on the easy side.
+    - "detectiveqa-clues-any": the same statements, counted as found when any passage of
+      the question turns up. The measure used before step 3.9; lenient, kept to compare.
 
-    Returns both sets and how many annotated positions were left out."""
+    Returns the three sets and how many annotated positions were left out."""
     questions: list[Question] = []
     clue_queries: list[Question] = []
+    clue_queries_any: list[Question] = []
     skipped = 0
     for path in sorted((folder / "novel_data_zh").glob("*.txt")):
         novel_id = path.name.split("-", 1)[0]
@@ -192,8 +199,8 @@ def detectiveqa_questions(folder: Path) -> tuple[list[Question], list[Question],
         data = data[0] if isinstance(data, list) else data
         paragraphs = paragraph_spans(path)
         for item in data["questions"]:
-            positions = [int(p) for p in item.get("clue_position", [])]
-            positions.append(int(item.get("answer_position", -1)))
+            clue_positions = [int(p) for p in item.get("clue_position", [])]
+            positions = [*clue_positions, int(item.get("answer_position", -1))]
             spans: set[Span] = set()
             for p in positions:
                 span = paragraphs.get(p) if p >= 0 else None
@@ -209,12 +216,23 @@ def detectiveqa_questions(folder: Path) -> tuple[list[Question], list[Question],
                 Question(corpus="detectiveqa", book=book, query=item["question"], relevant=relevant)
             )
             # The last reasoning line is the reasoning process, not a clue.
-            clue_queries += [
-                Question(corpus="detectiveqa-clues", book=book, query=line, relevant=relevant)
-                for line in item.get("reasoning", [])[:-1]
-                if len(line) >= _MIN_STATEMENT
-            ]
-    return questions, clue_queries, skipped
+            for i, line in enumerate(item.get("reasoning", [])[:-1]):
+                if len(line) < _MIN_STATEMENT:
+                    continue
+                clue_queries_any.append(
+                    Question(
+                        corpus="detectiveqa-clues-any", book=book, query=line, relevant=relevant
+                    )
+                )
+                own = clue_positions[i] if i < len(clue_positions) else -1
+                span = paragraphs.get(own) if own >= 0 else None
+                if span is not None:
+                    clue_queries.append(
+                        Question(
+                            corpus="detectiveqa-clues", book=book, query=line, relevant=(span,)
+                        )
+                    )
+    return questions, clue_queries, clue_queries_any, skipped
 
 
 # --- scoring ----------------------------------------------------------------------------

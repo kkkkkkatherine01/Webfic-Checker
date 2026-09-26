@@ -34,7 +34,11 @@ def chunk_text(text: str, size: int = 8000, overlap: int = 500) -> list[Chunk]:
         if end >= n:
             return chunks
 
-        next_start = text.rfind("\n", start + 1, end - overlap) + 1
+        # Start the next chunk on a line within 2x overlap of the end, else overlap hard.
+        # Looking further back could land on a line whose chunk ends at this same cut and
+        # so lies entirely inside this one (long paragraphs), a wasted model call.
+        lowest = max(start + 1, end - 2 * overlap)
+        next_start = text.rfind("\n", lowest, end - overlap) + 1
         if next_start <= start:
             next_start = end - overlap
         start = next_start

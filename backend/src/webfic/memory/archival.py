@@ -149,7 +149,9 @@ async def search_text(
     if character is not None:
         found = await find_character(session, user_id=user_id, book_id=book_id, name=character)
         aliases = await session.scalars(
-            select(CharacterAlias.alias).where(CharacterAlias.character_id == found.id)
+            select(CharacterAlias.alias).where(
+                CharacterAlias.user_id == user_id, CharacterAlias.character_id == found.id
+            )
         )
         names = {found.canonical_name, *aliases}
         filters.append(or_(*(PassageRow.text.contains(n) for n in names)))
@@ -168,7 +170,10 @@ async def search_text(
             matched.setdefault(passage_id, []).append(label)
     best = sorted(fused, key=lambda i: -fused[i])[:k]
     rows = {
-        r.id: r for r in await session.scalars(select(PassageRow).where(PassageRow.id.in_(best)))
+        r.id: r
+        for r in await session.scalars(
+            select(PassageRow).where(PassageRow.user_id == user_id, PassageRow.id.in_(best))
+        )
     }
     return [
         PassageHit(

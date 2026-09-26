@@ -177,6 +177,8 @@ def split_chapters(text: str) -> SplitResult:
     preamble_text = "\n".join(preamble).strip()
 
     if not chapters:
+        if not preamble_text:
+            return SplitResult(chapters=[], warnings=["没有正文。"])
         warnings.append("未识别到任何章节标题，整本作为一章处理。")
         return SplitResult(
             chapters=[RawChapter(number=1, title="全文", content=preamble_text)],

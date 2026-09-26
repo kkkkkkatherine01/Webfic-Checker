@@ -151,3 +151,44 @@ def test_a_stored_extraction_round_trips():
     assert again.revealed_names == original.revealed_names and again.dropped == ["幻觉"]
     assert again.llm_calls == 0
     assert extraction_version("p", 8000, 500) != extraction_version("p", 8000, 400)
+
+
+# --- step 3.9 -------------------------------------------------------------------------
+
+SHARED = "林远和苏晴是同学，两人都是十八岁。"
+
+
+def shared_age(name):
+    return {"mention": name, "raw_text": "两人都是十八岁", "statement_type": "absolute_age",
+            "value": 18}  # fmt: skip
+
+
+async def test_two_characters_sharing_a_quote_are_both_kept():
+    result = await extract_chapter(
+        client({"age_statements": [shared_age("林远"), shared_age("苏晴")]}),
+        chapter_number=1, text=SHARED, known_characters="（暂无）", system_prompt="json",
+        chunk_size=8000, chunk_overlap=500,
+    )  # fmt: skip
+    assert [a.statement.mention for a in result.ages] == ["林远", "苏晴"]
+
+
+async def test_a_statement_read_again_in_the_overlap_is_kept_once():
+    # Two chunks that both contain the shared sentence (the overlap) and both report
+    # the two characters: two facts, not four.
+    text = "甲" * 90 + "\n" + SHARED + "\n" + "乙" * 90
+    result = await extract_chapter(
+        client({"age_statements": [shared_age("林远"), shared_age("苏晴")]}),
+        chapter_number=1, text=text, known_characters="（暂无）", system_prompt="json",
+        chunk_size=150, chunk_overlap=60,
+    )  # fmt: skip
+    assert result.llm_calls > 1
+    assert sorted(a.statement.mention for a in result.ages) == ["林远", "苏晴"]
+
+
+def test_future_markers_leave_real_advances_alone():
+    from webfic.extraction.extractor import _FUTURE_MARKER
+
+    future = ["再过三年", "还有两年半", "还有三个月就要出发", "至少还要五年", "少说也得三年"]
+    advance = ["三年过去了，他还有些不适应", "至少过去了五年", "少说也过了三年", "三年后"]
+    assert all(_FUTURE_MARKER.search(x) for x in future)
+    assert not any(_FUTURE_MARKER.search(x) for x in advance)

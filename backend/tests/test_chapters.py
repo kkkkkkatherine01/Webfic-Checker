@@ -264,3 +264,14 @@ async def test_a_new_extraction_setup_reads_chapters_again(world):
         content = (await session.scalar(select(Chapter).where(Chapter.number == 3))).content
     result = await world.do(replace_with_settings, number=3, content=content)
     assert result.reused == 0
+
+
+async def test_blank_text_is_refused_and_nothing_changes(world):
+    before = await dump(world.factory)
+    with pytest.raises(InvalidEdit):
+        await world.do(chapters.append_chapters, text="  \n\n ")
+    assert await dump(world.factory) == before
+    async with world.factory() as session:
+        with pytest.raises(InvalidEdit):
+            await imports.create_import_job(session, user_id=USER, title="空", text="\n \n")
+    assert await dump(world.factory) == before

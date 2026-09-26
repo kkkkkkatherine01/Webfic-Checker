@@ -40,7 +40,7 @@ class TimeSpanView(BaseModel):
     chapter_number: int
     raw_text: str
     estimated_years: float | None
-    kind: str  # advance / short / retrospective
+    kind: str  # advance / short / retrospective / future
     is_flashback: bool
     char_start: int
     char_end: int
@@ -97,7 +97,7 @@ async def list_facts(
     await _check_book(session, user_id, book_id)
     query = (
         select(FactRow, Character.canonical_name)
-        .join(Character, Character.id == FactRow.character_id)
+        .join(Character, (Character.id == FactRow.character_id) & (Character.user_id == user_id))
         .where(FactRow.user_id == user_id, FactRow.book_id == book_id)
         .order_by(FactRow.chapter_number, FactRow.char_start)
     )

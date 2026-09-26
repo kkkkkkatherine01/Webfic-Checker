@@ -26,12 +26,16 @@ async def _load_age_facts(
     rows = (
         await session.execute(
             select(FactRow, Character.canonical_name)
-            .join(Character, Character.id == FactRow.character_id)
+            .join(
+                Character,
+                (Character.id == FactRow.character_id) & (Character.user_id == user_id),
+            )
             .where(
                 FactRow.user_id == user_id,
                 FactRow.book_id == book_id,
                 FactRow.category == AGE.name,
             )
+            .order_by(FactRow.chapter_number, FactRow.char_start, FactRow.id)
         )
     ).all()
     ages = [
@@ -51,6 +55,7 @@ async def _load_age_facts(
             char_start=r.char_start,
             char_end=r.char_end,
             chapter_id=r.chapter_id,
+            mention=r.mention,
         )
         for r, name in rows
     ]

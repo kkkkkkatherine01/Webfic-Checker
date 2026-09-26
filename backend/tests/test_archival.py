@@ -152,3 +152,54 @@ async def test_nobody_else_can_search_or_read(world):
             await read_passage(
                 session, user_id=uuid.uuid4(), book_id=world.book_id, chapter=1, start=0, end=2
             )
+
+
+# --- step 3.9 -------------------------------------------------------------------------
+
+
+def failing_on(marker):
+    """The chapter-test fake model, refusing any chapter that contains `marker`."""
+    from tests.fakes import FakeBackend, MemoryCallStore
+    from tests.test_chapters import respond
+    from webfic.llm.base import Tier
+    from webfic.llm.client import JsonLLMClient, TierConfig
+
+    def answer(messages):
+        return "garbage" if marker in messages[1].content else respond(messages)
+
+    tiers = {Tier.EXTRACT: TierConfig("deepseek-flash"), Tier.REASON: TierConfig("x")}
+    return JsonLLMClient(FakeBackend(answer), tiers, store=MemoryCallStore(), max_retries=0)
+
+
+async def chapter_passages(factory, number):
+    async with factory() as session:
+        return list(
+            await session.scalars(
+                select(PassageRow.text)
+                .where(PassageRow.chapter_number == number)
+                .order_by(PassageRow.char_start)
+            )
+        )
+
+
+async def test_a_chapter_whose_extraction_fails_is_still_indexed(factory, tmp_path):
+    world = World(factory, make_archival(tmp_path, size=40, overlap=10))
+    world.llm = failing_on("拒绝")
+    await world.load("第1章 起\n林远今年18岁。\n第2章 承\n这一章会被拒绝。\n")
+    assert await chapter_passages(factory, 2) == ["这一章会被拒绝。"]
+
+
+async def test_a_replaced_chapter_never_keeps_its_old_passages(world):
+    world.llm = failing_on("拒绝")
+    result = await world.do(chapters.replace_chapter, number=3, content="新的正文会被拒绝。")
+    assert result.failed == 1
+    assert await chapter_passages(world.factory, 3) == ["新的正文会被拒绝。"]
+
+
+async def test_names_known_later_are_found_in_earlier_chapters(factory, tmp_path):
+    # 宇智波鼬 becomes a character only in chapter 2 (the first age statement); chapter 1
+    # was indexed before, when jieba still cut the name into "宇智波 / 鼬".
+    world = World(factory, make_archival(tmp_path, size=40, overlap=10))
+    await world.load("第1章 起\n宇智波鼬站在门口。\n第2章 承\n宇智波鼬今年21岁。\n")
+    hits = await search(world, "宇智波鼬", mode="keyword")
+    assert {h.chapter_number for h in hits} == {1, 2}

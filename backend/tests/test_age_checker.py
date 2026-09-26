@@ -287,3 +287,28 @@ def test_speculative_ages_are_ignored():
 
 def test_life_stage_against_approximate_age():
     assert check_ages([approx(1, 12, 13), stage(2, LifeStage.TEEN)], []) == []
+
+
+def test_fingerprints_do_not_depend_on_the_order_facts_arrive_in():
+    # Step 3.9: two people's ages in one quote sit at the same place; which one counts as
+    # the quote's first occurrence must not follow the database's row order.
+    chapter = uuid.uuid4()
+
+    def fact(who, name, chapter_number, start, raw, value):
+        return AgeFact(
+            id=uuid.uuid4(), character_id=who, character_name=name, raw_text=raw,
+            statement_type="absolute_age", value=value, life_stage=None, is_flashback=False,
+            years_before_present=None, chapter_number=chapter_number, char_start=start,
+            char_end=start + len(raw), chapter_id=chapter if chapter_number == 2 else None,
+            mention=name,
+        )  # fmt: skip
+
+    facts = [
+        fact(LIN, "林远", 1, 0, "林远二十岁", 20),
+        fact(SU, "苏晴", 1, 10, "苏晴二十五岁", 25),
+        fact(LIN, "林远", 2, 0, "两人都是十八岁", 18),
+        fact(SU, "苏晴", 2, 0, "两人都是十八岁", 18),
+    ]
+    one = {i.subjects[0]: i.fingerprint for i in check_ages(facts, [])}
+    other = {i.subjects[0]: i.fingerprint for i in check_ages(facts[::-1], [])}
+    assert len(one) == 2 and one == other

@@ -224,7 +224,11 @@ async def save_state(
 ) -> None:
     """Store the state after one chapter: current states and that chapter's snapshot."""
     await _write_current(session, user_id, book_id, state)
-    await session.execute(delete(CoreSnapshot).where(CoreSnapshot.chapter_id == chapter_id))
+    await session.execute(
+        delete(CoreSnapshot).where(
+            CoreSnapshot.user_id == user_id, CoreSnapshot.chapter_id == chapter_id
+        )
+    )
     session.add(
         CoreSnapshot(
             user_id=user_id, book_id=book_id, chapter_id=chapter_id,
@@ -272,11 +276,16 @@ async def rebuild(session: AsyncSession, *, user_id: uuid.UUID, book_id: uuid.UU
     state = BookState()
     for chapter_id, number in chapters:
         facts = (
-            await session.scalars(select(FactRow).where(FactRow.chapter_id == chapter_id))
+            await session.scalars(
+                select(FactRow).where(FactRow.user_id == user_id, FactRow.chapter_id == chapter_id)
+            )
         ).all()
         spans = (
             await session.scalars(
-                select(ElapsedTimeFactRow).where(ElapsedTimeFactRow.chapter_id == chapter_id)
+                select(ElapsedTimeFactRow).where(
+                    ElapsedTimeFactRow.user_id == user_id,
+                    ElapsedTimeFactRow.chapter_id == chapter_id,
+                )
             )
         ).all()
         state = advance(

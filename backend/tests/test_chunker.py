@@ -45,3 +45,15 @@ def test_text_without_newlines_still_chunks():
 def test_rejects_overlap_not_smaller_than_size():
     with pytest.raises(ValueError):
         chunk_text("abc", size=10, overlap=10)
+
+
+def test_long_paragraphs_do_not_give_chunks_contained_in_the_previous_one():
+    # Step 3.9: 5000-character paragraphs used to yield a chunk inside the previous one
+    # after every cut (a wasted model call each time).
+    text = ("字" * 4999 + "\n") * 6
+    chunks = chunk_text(text)
+    for prev, nxt in pairwise(chunks):
+        assert nxt.end > prev.end
+        assert 500 <= prev.end - nxt.start <= 1000
+    assert chunks[-1].end == len(text)
+    assert len(chunks) == 6  # one per paragraph cut; it was 10

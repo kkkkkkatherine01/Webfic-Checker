@@ -66,19 +66,30 @@ def test_detectiveqa_questions_skip_reasoned_clues(tmp_path):
     (tmp_path / "human_anno").mkdir()
     (tmp_path / "novel_data_zh" / "900-测试-作者.txt").write_text(NOVEL, "utf-8")
     anno = [{"novel_id": 900, "questions": [
-        {"question": "谁在建房？", "clue_position": [3, -1, 2], "answer_position": 4,
-         "reasoning": ["罗杰在岛上建了房子，大家觉得怪", "短", "推理过程：所以是罗杰"]},
+        {"question": "谁在建房？", "clue_position": [3, -1, 2, -1], "answer_position": 4,
+         "reasoning": ["罗杰在岛上建了房子，大家觉得怪", "由此推断他早有准备的", "短",
+                       "推理过程：所以是罗杰"]},
         {"question": "只有推理？", "clue_position": [-1], "answer_position": -1},
     ]}]  # fmt: skip
     (tmp_path / "human_anno" / "900.json").write_text(json.dumps(anno, ensure_ascii=False), "utf-8")
-    questions, clues, skipped = detectiveqa_questions(tmp_path)
+    questions, clues, clues_any, skipped = detectiveqa_questions(tmp_path)
     assert [q.query for q in questions] == ["谁在建房？"]
-    # Clue statements become queries of their own (too-short lines and the final
-    # reasoning line are not), over the same relevant passages.
-    assert [c.query for c in clues] == ["罗杰在岛上建了房子，大家觉得怪"]
-    assert clues[0].relevant == questions[0].relevant and clues[0].corpus == "detectiveqa-clues"
     assert len(questions[0].relevant) == 2  # paragraphs 3 and 4; the heading 2 is not text
-    assert skipped == 4  # -1, the heading, and the second question's -1 and answer
+    # Each clue statement is a query whose answer is its own paragraph (reasoning[i] states
+    # clue_position[i]); a reasoned clue (-1), a too-short line and the final reasoning
+    # line are not queries.
+    assert [c.query for c in clues] == ["罗杰在岛上建了房子，大家觉得怪"]
+    assert clues[0].corpus == "detectiveqa-clues"
+    assert clues[0].relevant == (
+        paragraph_spans(tmp_path / "novel_data_zh" / "900-测试-作者.txt")[3],
+    )
+    # The lenient set of before: every statement, any passage of the question counts.
+    assert [c.query for c in clues_any] == [
+        "罗杰在岛上建了房子，大家觉得怪",
+        "由此推断他早有准备的",
+    ]
+    assert all(c.relevant == questions[0].relevant for c in clues_any)
+    assert skipped == 5  # two -1, the heading, and the second question's -1 and answer
 
 
 @needs_golden

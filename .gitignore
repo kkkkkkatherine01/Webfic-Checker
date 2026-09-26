@@ -41,5 +41,6 @@ eval/private/
 # the stories). Tests that need them skip when eval/golden/ is absent.
 eval/golden/
 eval/baseline*.json
+eval/*-baseline*.json
 # Downloaded evaluation corpora (WebNovelBench, 蜀山剑侠传, DetectiveQA)
 eval/external/

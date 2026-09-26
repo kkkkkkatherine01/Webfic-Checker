@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-AGE_SCHEMA_VERSION = "age_v3"
+AGE_SCHEMA_VERSION = "age_v4"
 
 
 class LifeStage(StrEnum):
@@ -48,11 +48,16 @@ class AgeStatement(BaseModel):
     # The text that states how long ago it was ("十五年前"); without it the offset is
     # the model's own guess and is discarded.
     years_before_present_quote: str | None = None
-    # A character's guess, a hypothetical or hearsay ("大概三十出头吧", "就算他四十岁").
+    # A character's guess, an impression from appearance, a hypothetical or hearsay
+    # ("大概三十出头吧", "看上去不过十七八岁", "就算他四十岁").
     speculative: bool = False
+    # Not any one character's age: a rule, a generalisation, a group or a figure of speech
+    # ("年满十六岁才能下山", "像个三岁小孩"). Labelled rather than left out (models label
+    # more reliably than they omit); such statements are dropped before resolution.
+    generic: bool = False
 
 
-ElapsedKind = Literal["advance", "short", "retrospective"]
+ElapsedKind = Literal["advance", "short", "retrospective", "future"]
 
 # An "advance" shorter than this is really a "short" one.
 SHORT_SPAN_YEARS = 1 / 12
@@ -66,7 +71,9 @@ class ElapsedTimeStatement(BaseModel):
     #   matter for ages, and often unquantified, so checkers ignore it.
     # "retrospective": a summary of time already passed ("这两年她奔波在外"); it does not
     #   move the present.
-    # Models label more reliably than they omit, so all three are extracted.
+    # "future": time that has not come yet: a plan, a promise, a deadline, a condition
+    #   ("再过三年我就能出师"); it does not move the present either.
+    # Models label more reliably than they omit, so all four are extracted.
     kind: ElapsedKind = "advance"
     is_flashback: bool = False
 

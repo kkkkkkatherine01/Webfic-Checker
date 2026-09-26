@@ -60,6 +60,37 @@ class EvalCallStore:
             await self._cache.record(record)
 
 
+class ReplayCallStore:
+    """Serves earlier fresh samples back from the eval cache: sample i gets the i-th
+    recorded answer to the same request (cycling when there are fewer). Lets scoring,
+    annotations or post-processing change without paying for new samples; a request never
+    seen before (a code change altered what later chapters are asked) goes to the model
+    and is recorded."""
+
+    def __init__(self, cache: Factory, sample: int):
+        self._cache, self._sample = cache, sample
+        self._store = DbCallStore(cache, user_id=None)
+        self.misses = 0
+
+    async def lookup(self, request_hash: str) -> str | None:
+        async with self._cache() as session:
+            answers = (
+                await session.scalars(
+                    select(LLMCallRow.response_text)
+                    .where(LLMCallRow.request_hash == request_hash, LLMCallRow.ok.is_(True))
+                    .order_by(LLMCallRow.created_at, LLMCallRow.id)
+                )
+            ).all()
+        if not answers:
+            self.misses += 1
+            return None
+        return answers[self._sample % len(answers)]
+
+    async def record(self, record: CallRecord) -> None:
+        if not record.cache_hit:
+            await self._store.record(record)
+
+
 async def open_cache(path: Path) -> Factory:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Concurrent samples write here; wait for the lock instead of failing.
@@ -135,17 +166,17 @@ async def _observe(factory: Factory, book_id: uuid.UUID, dropped: int) -> Observ
     )
 
 
-async def run_sample(
-    story: Story,
+async def import_and_observe(
+    title: str,
+    text: str,
     settings: Settings,
     make_client: ClientFactory,
     cache: Factory,
     *,
     fresh: bool,
-) -> SampleResult:
-    started = time.monotonic()
-    overrides = story.golden.settings.model_dump(exclude_none=True)
-    settings = settings.model_copy(update=overrides)
+) -> tuple[Observation, imports.ImportJobResult]:
+    """Import `text` as a new book in a throw-away database, run the checks, and return
+    what the pipeline produced."""
     with tempfile.TemporaryDirectory(prefix="webfic-eval-") as tmp:
         engine = make_engine(f"sqlite+aiosqlite:///{Path(tmp, 'run.db').as_posix()}")
         try:
@@ -155,7 +186,7 @@ async def run_sample(
 
             async with factory() as session:
                 job = await imports.create_import_job(
-                    session, user_id=EVAL_USER, title=story.golden.title, text=story.text
+                    session, user_id=EVAL_USER, title=title, text=text
                 )
             store = EvalCallStore(
                 DbCallStore(factory, user_id=EVAL_USER, book_id=job.book_id),
@@ -167,10 +198,25 @@ async def run_sample(
             )
             async with factory() as session:
                 await checks.run_checks(session, user_id=EVAL_USER, book_id=job.book_id)
-            observation = await _observe(factory, job.book_id, result.dropped_statements)
+            return await _observe(factory, job.book_id, result.dropped_statements), result
         finally:
             await engine.dispose()
 
+
+async def run_sample(
+    story: Story,
+    settings: Settings,
+    make_client: ClientFactory,
+    cache: Factory,
+    *,
+    fresh: bool,
+) -> SampleResult:
+    started = time.monotonic()
+    overrides = story.golden.settings.model_dump(exclude_none=True)
+    settings = settings.model_copy(update=overrides)
+    observation, result = await import_and_observe(
+        story.golden.title, story.text, settings, make_client, cache, fresh=fresh
+    )
     return SampleResult(
         score=score_story(story, observation),
         cost_usd=result.cost_usd,

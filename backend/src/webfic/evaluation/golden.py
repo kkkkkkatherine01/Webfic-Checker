@@ -56,7 +56,7 @@ class ExpectedAge(BaseModel):
 class ExpectedElapsed(BaseModel):
     chapter: int
     quote: str
-    kind: Literal["advance", "short", "retrospective"]
+    kind: Literal["advance", "short", "retrospective", "future"]
     years: float | None = None
     flashback: bool = False
 

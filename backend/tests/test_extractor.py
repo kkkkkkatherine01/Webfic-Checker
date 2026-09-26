@@ -3,7 +3,10 @@ from webfic.extraction.extractor import extract_chapter
 from webfic.llm.base import Tier
 from webfic.llm.client import JsonLLMClient, TierConfig
 
-TEXT = "三天之后，他们到了镇上。三年后，那人自称沈砚。"
+TEXT = (
+    "三天之后，他们到了镇上。三年后，那人自称沈砚。“再过五年我就回来。”"
+    "若干年后，镇上的孩子年满十岁都要去学堂。"
+)
 
 
 def client(answer):
@@ -28,6 +31,29 @@ async def test_tiny_advance_is_relabelled_short():
         }
     )
     assert [e.statement.kind for e in result.elapsed] == ["short", "advance"]
+
+
+async def test_advance_with_a_future_marker_is_relabelled_future():
+    result = await extract(
+        {
+            "elapsed_time_statements": [
+                {"raw_text": "三年后", "estimated_years": 3, "kind": "advance"},
+                {"raw_text": "再过五年", "estimated_years": 5, "kind": "advance"},
+                {"raw_text": "若干年后", "estimated_years": None, "kind": "advance"},
+            ]
+        }
+    )
+    # "三年后" in narration and "若干年后" (若 but not a condition) stay advances.
+    assert [e.statement.kind for e in result.elapsed] == ["advance", "future", "advance"]
+
+
+async def test_generic_ages_are_dropped():
+    age = {"mention": "孩子", "resolved_name": None, "raw_text": "年满十岁都要去学堂",
+           "statement_type": "absolute_age", "value": 10}  # fmt: skip
+    result = await extract({"age_statements": [{**age, "generic": True}]})
+    assert result.ages == [] and result.dropped == ["年满十岁都要去学堂"]
+    result = await extract({"age_statements": [age]})
+    assert len(result.ages) == 1
 
 
 async def test_revealed_name_must_appear_in_text():
@@ -69,6 +95,20 @@ async def test_offset_is_kept_only_when_its_quote_is_in_the_text():
     )
     offsets = [a.statement.years_before_present for a in result.ages]
     assert offsets == [15, None]  # the third is the same statement: deduplicated
+
+
+def test_upper_bounds_alone_are_not_ages():
+    from webfic.extraction.extractor import _valid_age
+    from webfic.extraction.schemas import AgeStatement
+
+    def age(raw, value):
+        return AgeStatement(mention="他", raw_text=raw, statement_type="absolute_age", value=value)
+
+    assert not _valid_age(age("连一千岁都不到", 999))
+    assert not _valid_age(age("还没到三十岁", 29))
+    assert not _valid_age(age("不到二十岁的年纪", 19))
+    assert _valid_age(age("这家伙今年还未满十八周岁", 17))
+    assert _valid_age(age("他三十岁不到就当上了掌门", 29)) is False  # an upper bound too
 
 
 def test_durations_are_not_ages():

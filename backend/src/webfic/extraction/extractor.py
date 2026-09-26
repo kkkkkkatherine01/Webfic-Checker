@@ -113,15 +113,30 @@ def build_user_message(
     return f"已知角色：\n{known_characters}\n\n正文（第 {chapter_number} 章{part}）：\n{chunk.text}"
 
 
+# "再过三年", "至少还要五年", "若能…三年之内": markers of time that has not come yet. An
+# "advance" carrying one is a plan or a condition, not the story moving on. "N年后" alone
+# is not a marker: narration uses it for real jumps ("三年后，他回到了故乡").
+_FUTURE_MARKER = re.compile(
+    r"再过|还要|还得|还有|至少|少说|打算|约定|约好|倘若|若是|若能|如果|要是|以内|之内"
+)
+
 # "迟来十八年的长眠", "守了三十年": a number of years is a duration, not an age. Ages are
 # written with 岁 or bare ("今年二十五", "年方二八", "小三十了"), never as "N年".
 _DURATION = re.compile(r"[\d零〇一二两三四五六七八九十百几数]+年(?!纪|方|华|龄|岁)")
+
+
+# "连一千岁都不到", "还没到三十岁": only an upper bound, so the age is unknown. ("未满十八
+# 周岁" is different: a fixed phrase for seventeen.)
+_NUM = r"[\d零〇一二两三四五六七八九十百千几]+"
+_UPPER_BOUND_ONLY = re.compile(rf"(?:不到|没到|未到|不足){_NUM}岁|{_NUM}岁(?:都|也)?(?:不到|没到)")
 
 
 def _valid_age(s: AgeStatement) -> bool:
     match s.statement_type:
         case "absolute_age":
             if "岁" not in s.raw_text and _DURATION.search(s.raw_text):
+                return False
+            if _UPPER_BOUND_ONLY.search(s.raw_text):
                 return False
             return s.value is not None and 0 <= s.value <= _MAX_PLAUSIBLE_AGE
         case "life_stage":
@@ -184,7 +199,7 @@ async def extract_chapter(
             span = locate(chunk.text, s.raw_text, start_from=last_end.get(s.raw_text, 0))
             if span is not None:
                 last_end[s.raw_text] = span[1]
-            if span is None or not _valid_age(s):
+            if span is None or s.generic or not _valid_age(s):
                 result.dropped.append(s.raw_text)
                 continue
             start, end = span[0] + chunk.start, span[1] + chunk.start
@@ -206,6 +221,8 @@ async def extract_chapter(
             if (start, end) in seen_elapsed:
                 continue
             seen_elapsed.add((start, end))
+            if e.kind == "advance" and _FUTURE_MARKER.search(e.raw_text):
+                e = e.model_copy(update={"kind": "future"})
             if (
                 e.kind == "advance"
                 and e.estimated_years is not None

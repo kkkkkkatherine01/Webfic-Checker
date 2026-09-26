@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import subprocess
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -258,6 +259,295 @@ def compare(
             console.print(f"\n[bold {color}]{title}[/]")
             for item in sorted(items):
                 console.print(f"  {item}")
+
+
+REALTEXT_DIR = EVAL_DIR / "external" / "realtext"
+
+
+def _realtext_table(run) -> Table:
+    table = Table(
+        "章节", "年龄召回", "年龄精确", "属性全对", "时间段召回", "推进判断", "推进精确",
+        "将来时长标错", "陷阱", "合并/拆分", "判定一致", "年龄抽取一致",
+        title=f"真实文本抽取（{'按顺序抽取整段' if run.mode == 'context' else '单章抽取'}）",
+    )  # fmt: skip
+    for m in run.rows:
+        style = "bold" if not m.name.isdigit() else None
+        table.add_row(
+            m.name, str(m.age_recall), str(m.age_precision), str(m.age_accuracy),
+            str(m.elapsed_recall), str(m.elapsed_accuracy), str(m.advance_precision),
+            str(m.future_taken), str(m.trap_pass), f"{m.merges}/{m.splits}", str(m.stable),
+            str(m.age_consistency), style=style,
+        )  # fmt: skip
+    return table
+
+
+@app.command()
+def realtext(
+    samples: Annotated[int, typer.Option(min=1, help="每章运行次数；>1 时自动绕过缓存")] = 5,
+    fresh: Annotated[bool, typer.Option(help="绕过缓存，真实调用模型")] = False,
+    replay: Annotated[
+        bool,
+        typer.Option(help="从评估缓存重放之前各次采样的输出；缓存里没有的请求才调用模型"),
+    ] = False,
+    single: Annotated[bool, typer.Option(help="同时做单章抽取的对比")] = True,
+    check: Annotated[bool, typer.Option(help="只校验标注，不调用模型")] = False,
+    concurrency: Annotated[int, typer.Option(min=1, help="同时运行的导入数")] = 6,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "realtext",
+    baseline: Annotated[bool, typer.Option(help="同时保存为 eval/realtext-baseline.json")] = False,
+) -> None:
+    """真实网文抽取质量（3.5-1）：召回、精确、属性、推进误抽、陷阱、多次采样的一致性。"""
+    from webfic.evaluation import realtext as rt
+    from webfic.evaluation.runner import ReplayCallStore
+
+    external = EVAL_DIR / "external"
+    try:
+        annotations = rt.load_annotations(REALTEXT_DIR / "annotations.yaml")
+        picks = rt.load_picks(REALTEXT_DIR / "selection.json")
+        books = {
+            b.name: b
+            for b in rt.webnovelbench_books(
+                external / "webnovelbench" / "novel_data_subset_d_100.json"
+            )
+        }
+        books["shushan"] = rt.shushan_book(external / "shushan" / "shushan_001-012.txt")
+        modes = ["context", "single"] if single else ["context"]
+        plans = {mode: rt.plan_jobs(annotations, picks, books, mode) for mode in modes}
+    except (OSError, rt.AnnotationError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    required = sum(len(a.ages) + len(a.elapsed) for a in annotations)
+    console.print(f"[green]✓[/] 标注 {len(annotations)} 章，必抽 {required} 条")
+    if check:
+        return
+
+    settings = get_settings()
+    fresh = not replay and (fresh or samples > 1)
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    async def main() -> list:
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+
+        def client_for_sample(sample: int):
+            if replay:
+                store = ReplayCallStore(cache, sample)
+                return lambda _: platform_client(settings, store)
+            return lambda store: platform_client(settings, store)
+
+        runs = []
+        count = {"done": 0, "total": sum(len(jobs) for jobs in plans.values()) * samples}
+
+        def progress(job, sample) -> None:
+            count["done"] += 1
+            console.print(f"  [{count['done']}/{count['total']}] {job.name} 第 {sample + 1} 次")
+
+        for mode, jobs in plans.items():
+            console.print(f"{mode}：{len(jobs)} 个导入 × {samples} 次…")
+            run = await rt.run_mode(
+                jobs, mode, settings, client_for_sample, cache, samples=samples, fresh=fresh,
+                concurrency=concurrency, on_done=None if replay else progress,
+            )  # fmt: skip
+            runs.append(run)
+        return runs
+
+    runs = asyncio.run(main())
+    report = rt.RealtextReport(
+        label=label,
+        created_at=datetime.now().astimezone(),
+        extract_model=settings.llm_extract_model,
+        prompt_hash=hashlib.sha256(load_prompt().encode()).hexdigest()[:12],
+        git_commit=_git_commit(),
+        samples=samples,
+        fresh=fresh,
+        replay=replay,
+        runs=runs,
+    )
+    for run in runs:
+        console.print(_realtext_table(run))
+        overall = run.rows[0]
+        spread = "、".join(f"{k} 次 {n} 条" for k, n in overall.found_in.items())
+        console.print(
+            f"必抽条目在 {samples} 次中被抽到的次数：{spread}；"
+            f"时间段精确（仅供参考，时长未完整标注）{overall.elapsed_precision}"
+        )
+        if run.failed_chapters:
+            console.print(f"[bold red]抽取失败的章节（各次累计）：{run.failed_chapters}[/]")
+        console.print(
+            f"LLM 调用 {run.llm_calls} 次（缓存命中 {run.cache_hits}），花费 ${run.cost_usd:.4f}"
+        )
+    console.print("\n[bold]错误（按顺序抽取；出现次数）[/]")
+    for err, n in list(runs[0].rows[0].errors.items())[:60]:
+        console.print(f"  ×{n} {err}")
+
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-realtext-{label}.json"
+    path.write_text(report.model_dump_json(indent=2), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+    if baseline:
+        (EVAL_DIR / "realtext-baseline.json").write_text(report.model_dump_json(indent=2), "utf-8")
+        console.print(f"已保存为基线：{EVAL_DIR / 'realtext-baseline.json'}")
+
+
+class _LayeredStore:
+    """Looks a request up in several stores in turn; records to all of them. `fresh`
+    skips the lookups (a new sample)."""
+
+    def __init__(self, *stores: CallStore, fresh: bool = False):
+        self._stores, self._fresh = stores, fresh
+
+    async def lookup(self, request_hash: str) -> str | None:
+        if self._fresh:
+            return None
+        for store in self._stores:
+            if (found := await store.lookup(request_hash)) is not None:
+                return found
+        return None
+
+    async def record(self, record) -> None:
+        for store in self._stores:
+            if not record.cache_hit or store is self._stores[0]:
+                await store.record(record)
+
+
+@app.command()
+def inject(
+    prepare_only: Annotated[bool, typer.Option(help="只导入并抽取底稿，不注入")] = False,
+    books: Annotated[int, typer.Option(help="只用前 N 部底稿（试跑用；0 = 全部）")] = 0,
+    scale: Annotated[float, typer.Option(help="各类型数量乘以这个系数（试跑用）")] = 1.0,
+    fresh: Annotated[bool, typer.Option(help="注入时绕过缓存，真实调用模型")] = False,
+    seed: Annotated[int, typer.Option(help="选注入点的随机种子")] = 0,
+    concurrency: Annotated[int, typer.Option(min=1, help="同时处理的作品数")] = 6,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "inject",
+    baseline: Annotated[bool, typer.Option(help="同时保存为 eval/inject-baseline.json")] = False,
+) -> None:
+    """错误注入评估（3.5-2）：在真实网文里注入年龄矛盾和对照改动，逐处试算，看能否报出。"""
+    from webfic.db.session import make_engine, make_session_factory
+    from webfic.evaluation import inject as ij
+    from webfic.llm.cache import DbCallStore
+
+    settings = get_settings()
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    items = ij.bases(EVAL_DIR / "external", EVAL_DIR / "private")
+    if books:
+        items = items[:books]
+    console.print(f"底稿 {len(items)} 部，{sum(len(b.text) for b in items)} 字")
+
+    async def main():
+        engine = make_engine(settings.database_url)
+        factory = make_session_factory(engine)
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+
+        def make_llm(book_id, *, fresh_calls: bool = False):
+            store = _LayeredStore(
+                DbCallStore(factory, user_id=ij.INJECT_USER, book_id=book_id),
+                DbCallStore(cache, user_id=None),
+                fresh=fresh_calls,
+            )
+            return platform_client(settings, store)
+
+        try:
+            prepared = await ij.prepare(
+                factory, make_llm, settings, items, concurrency=concurrency,
+                on_progress=console.print,
+            )  # fmt: skip
+            async with factory() as session:
+                views = [await ij.load_view(session, b.name, prepared[b.name]) for b in items]
+            if prepare_only:
+                return views, []
+            quotas = {k: max(1, round(q * scale)) for k, q in ij.QUOTAS.items()}
+            injections = ij.plan(views, quotas, seed or ij.SEED)
+            console.print(
+                "注入："
+                + "、".join(
+                    f"{label} {sum(i.kind == k for i in injections)}"
+                    for k, label in ij.KINDS.items()
+                )
+            )
+            count = {"done": 0}
+
+            def done(outcome) -> None:
+                count["done"] += 1
+                if count["done"] % 10 == 0:
+                    console.print(f"  [{count['done']}/{len(injections)}]")
+
+            outcomes = await ij.run_all(
+                factory, lambda book_id: make_llm(book_id, fresh_calls=fresh), settings,
+                prepared, injections, concurrency=concurrency, on_done=done,
+            )  # fmt: skip
+            return views, outcomes
+        finally:
+            await engine.dispose()
+
+    views, outcomes = asyncio.run(main())
+    original = [i for v in views for i in v.issues]
+    by_confidence = Counter(str(i.confidence) for i in original)
+    console.print(
+        f"原文上的矛盾报告：{len(original)} 条（"
+        + "、".join(f"{k} {n}" for k, n in by_confidence.most_common())
+        + "）"
+    )
+    if prepare_only:
+        return
+
+    kinds = ij.score(outcomes)
+    table = Table(
+        "类型", "数量", "检出", "置信度对", "误报", "注入年龄抽对", "抽成推进", "报告有变化",
+        "连带变化", "花费 $", title="错误注入评估",
+    )  # fmt: skip
+    for m in kinds:
+        detect = m.kind in ij.DETECT
+        table.add_row(
+            m.label, str(m.n), str(m.detected) if detect else "",
+            str(m.confidence_right) if detect else "", "" if detect else str(m.false_alarm),
+            str(m.age_extracted_right), str(m.taken_as_advance), str(m.report_changed),
+            str(m.collateral), f"{m.cost_usd:.4f}",
+        )  # fmt: skip
+    console.print(table)
+    for m in kinds:
+        if m.misses:
+            console.print(f"\n[bold]{m.label} 漏报原因[/]：" + "、".join(
+                f"{k} {n}" for k, n in m.misses.items()))  # fmt: skip
+        if m.by_distance:
+            console.print(
+                f"  {m.label} 按距离：" + "、".join(f"{k} {r}" for k, r in m.by_distance.items())
+            )
+    for o in outcomes:
+        if o.injection.kind not in ij.DETECT and o.involving:
+            console.print(f"\n[red]误报[/] {o.injection.id}：{o.injection.detail}")
+            for text in o.involving:
+                console.print(f"    {text}")
+    failed = sum(o.failed for o in outcomes)
+    if failed:
+        console.print(f"[bold red]注入所在章节抽取失败：{failed} 处[/]")
+
+    report = ij.InjectReport(
+        label=label,
+        created_at=datetime.now().astimezone().isoformat(),
+        extract_model=settings.llm_extract_model,
+        prompt_hash=hashlib.sha256(load_prompt().encode()).hexdigest()[:12],
+        git_commit=_git_commit(),
+        seed=seed or ij.SEED,
+        books=len(views),
+        original_issues=len(original),
+        kinds=kinds,
+        outcomes=outcomes,
+    )
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-inject-{label}.json"
+    path.write_text(report.model_dump_json(indent=2), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+    if baseline:
+        (EVAL_DIR / "inject-baseline.json").write_text(report.model_dump_json(indent=2), "utf-8")
+        console.print(f"已保存为基线：{EVAL_DIR / 'inject-baseline.json'}")
 
 
 @app.command("retrieval-prepare")

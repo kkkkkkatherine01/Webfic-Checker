@@ -125,6 +125,18 @@ def test_generic_mentions_from_real_text():
     assert is_generic_mention("Ilya Igorevich Osipov Junior")  # more than 3 words
 
 
+def test_roles_and_kin_are_not_names():
+    # Step 3.5: "老头子" merged two old men; "老伴" and "凶犯" became characters.
+    for mention in ["老头子", "白发老汉", "老伴", "凶犯", "表弟", "女孩", "那老妪", "白老头"]:
+        assert is_generic_mention(mention), mention
+    for name in ["老周", "老赵头", "王老汉子", "小孩儿张"]:  # names that merely contain them
+        assert not is_generic_mention(name), name
+    idx = index()
+    assert idx.resolve("老头子", "林远") == LIN  # resolved in context by the model...
+    assert idx.resolve("老伴", None) is None  # ...but never a name of its own
+    assert idx.new_aliases == [] and idx.new_characters == []
+
+
 def test_generic_mention_resolved_to_known_character_is_not_stored():
     idx = index()
     assert idx.resolve("五火和带土", "林远") == LIN  # the model decides who...

@@ -12,11 +12,18 @@ _GENERIC_MENTIONS = {
     "人家", "在下", "本座", "老夫", "大家", "众人",
     "少年", "少女", "青年", "老者", "老人", "男子", "女子", "孩子", "婴儿", "年轻人",
     "师兄", "师姐", "师弟", "师妹", "师父", "师傅", "父亲", "母亲", "大哥", "小弟",
+    # Roles and kin: whoever fits them in the scene at hand (step 3.5 found "老头子"
+    # merging two old men into one character, and "老伴", "凶犯" made characters).
+    "老头", "老头子", "老头儿", "老汉", "老妪", "老太", "老太太", "老太婆", "老伴", "老婆",
+    "老公", "丈夫", "妻子", "儿子", "女儿", "爷爷", "奶奶", "外公", "外婆", "姥姥", "孙子",
+    "孙女", "表哥", "表弟", "表姐", "表妹", "堂哥", "堂弟", "堂姐", "堂妹", "女孩", "男孩",
+    "小孩", "凶手", "凶犯", "犯人", "嫌犯",
 }  # fmt: skip
 _DEMONSTRATIVE = re.compile(r"^(那|这|那个|这个|此|该)")
 # Descriptions such as "白发老者" or "青衣少女" can describe other people too.
 _GENERIC_SUFFIXES = ("老者", "老人", "老人家", "老家伙", "小家伙", "少年", "少女", "男子",
-                     "女子", "青年", "孩子", "小孩", "姑娘", "年轻人")  # fmt: skip
+                     "女子", "青年", "孩子", "小孩", "姑娘", "年轻人", "老头", "老头子",
+                     "老汉", "老妪", "老太", "女孩", "男孩")  # fmt: skip
 # Groups ("他们", "两个小孩") and pairs ("五火和带土") are not one person.
 _GROUP_MARKERS = ("们", "两个", "几个", "二人", "两人", "俩", "诸位", "各位")
 # Names contain these characters too (和珅, 林同光, 司徒和), so a mention is a pair only

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from webfic.checkers.types import Confidence, Evidence, IssueStatus
 from webfic.db.models import Book, Chapter, Character, IssueRow, LLMCallRow
 from webfic.services.errors import NotFound
+from webfic.services.verification import VerificationView, current_verifications
 
 
 class BookSummary(BaseModel):
@@ -32,6 +33,8 @@ class IssueView(BaseModel):
     description: str
     evidence: list[Evidence]
     subjects: list[str]
+    # The verify agent's still-valid verdict (step 4), if the issue has been verified.
+    verification: VerificationView | None = None
 
 
 class Report(BaseModel):
@@ -142,8 +145,17 @@ async def get_report(
     query = select(IssueRow).where(IssueRow.user_id == user_id, IssueRow.book_id == book_id)
     if not include_closed:
         query = query.where(IssueRow.status.in_([IssueStatus.OPEN, IssueStatus.ACKNOWLEDGED]))
-    issues = sort_issues([issue_view(row) for row in await session.scalars(query)])
-    return Report(book_id=book.id, title=book.title, issues=issues)
+    rows = (await session.scalars(query)).all()
+    verdicts = await current_verifications(session, user_id, book.id, list(rows))
+    issues = []
+    for row in rows:
+        view = issue_view(row)
+        view.verification = verdicts.get(row.id)
+        # Dismissed as a false alarm by the verify agent: kept, shown only with everything.
+        dismissed = view.verification is not None and view.verification.verdict == "false_alarm"
+        if include_closed or not dismissed:
+            issues.append(view)
+    return Report(book_id=book.id, title=book.title, issues=sort_issues(issues))
 
 
 async def get_usage(

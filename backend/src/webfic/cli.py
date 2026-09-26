@@ -3,6 +3,7 @@
 import asyncio
 import json
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated
@@ -15,6 +16,7 @@ from rich.table import Table
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from webfic.agent.verify import REASON_LABEL
 from webfic.archival.index import platform_archival, reindex_book
 from webfic.checkers.types import Confidence
 from webfic.config import Settings, get_settings
@@ -23,7 +25,7 @@ from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
 from webfic.memory import archival, core
-from webfic.services import chapters, checks, imports, reports, traces
+from webfic.services import chapters, checks, imports, reports, traces, verification
 from webfic.services.errors import InvalidEdit, NotFound
 
 app = typer.Typer(help="网文一致性检查工具", no_args_is_help=True, add_completion=False)
@@ -148,13 +150,59 @@ async def _check(settings: Settings, factory: Factory, book_id: uuid.UUID) -> No
     )
 
 
+Verify = Annotated[
+    bool, typer.Option(help="用校验 agent 核实还没核实过的问题（误报默认从报告中隐藏）")
+]
+
+_VERDICT_LABEL = {
+    "contradiction": "[bold red]真矛盾[/]",
+    "false_alarm": "[green]误报[/]",
+    "needs_author": "[yellow]需作者确认[/]",
+    None: "[dim]核实未完成[/]",
+}
+
+
+def _verdict_line(v: verification.VerificationView) -> str:
+    reason = f"（{REASON_LABEL.get(v.reason, v.reason)}）" if v.reason else ""
+    run = f"  [dim]webfic trace {str(v.run_id)[:8]}[/]" if v.run_id else ""
+    return f"校验：{_VERDICT_LABEL[v.verdict]}{reason} {escape(v.explanation or '')}{run}"
+
+
+async def _verify(
+    settings: Settings,
+    factory: Factory,
+    book_id: uuid.UUID,
+    *,
+    issue_ids: list[uuid.UUID] | None = None,
+    again: bool = False,
+) -> None:
+    user_id = settings.dev_user_id
+    llm = platform_client(settings, DbCallStore(factory, user_id=user_id, book_id=book_id))
+    with console.status("校验 agent 正在核实…"):
+        result = await verification.verify_issues(
+            factory, llm, settings, user_id=user_id, book_id=book_id, issue_ids=issue_ids,
+            again=again, archival=platform_archival(settings),
+        )  # fmt: skip
+    for outcome in result.verified:
+        console.print(f"\n{escape(outcome.description)}")
+        console.print(f"   {_verdict_line(outcome.verification)}")
+    counts = Counter(o.verification.verdict for o in result.verified)
+    console.print(
+        f"\n核实 {len(result.verified)} 个问题：真矛盾 {counts['contradiction']}、"
+        f"误报 {counts['false_alarm']}、需作者确认 {counts['needs_author']}、"
+        f"未完成 {counts[None]}；另有 {result.already} 个已核实过（结论仍有效）。"
+        f"费用约 ${result.cost_usd:.4f}"
+    )
+
+
 @app.command()
 def ingest(
     file: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="整本 txt")],
     title: Annotated[str | None, typer.Option(help="作品名，默认用文件名")] = None,
     check: Annotated[bool, typer.Option(help="抽取后立即运行检查")] = True,
+    verify: Verify = True,
 ) -> None:
-    """导入作品：切章 → 抽取 → （检查）。"""
+    """导入作品：切章 → 抽取 → （检查 → 核实）。"""
     text = _read_text(file)
 
     async def main(settings: Settings, factory: Factory) -> None:
@@ -171,6 +219,8 @@ def ingest(
         await _extract(settings, factory, job.book_id)
         if check:
             await _check(settings, factory, job.book_id)
+            if verify:
+                await _verify(settings, factory, job.book_id)
 
     _run(main)
 
@@ -179,6 +229,7 @@ def ingest(
 def resume(
     book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
     check: Annotated[bool, typer.Option(help="抽取后立即运行检查")] = True,
+    verify: Verify = True,
 ) -> None:
     """继续抽取未完成或失败的章节。"""
 
@@ -187,6 +238,8 @@ def resume(
         await _extract(settings, factory, book_id)
         if check:
             await _check(settings, factory, book_id)
+            if verify:
+                await _verify(settings, factory, book_id)
 
     _run(main)
 
@@ -204,7 +257,9 @@ def check_cmd(book: Annotated[str, typer.Argument(help="作品 ID（可只写前
 @app.command()
 def report(
     book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
-    all_: Annotated[bool, typer.Option("--all", help="包含已解决/标记为刻意设计的问题")] = False,
+    all_: Annotated[
+        bool, typer.Option("--all", help="包含已解决 / 刻意设计 / 被校验判为误报的问题")
+    ] = False,
     as_json: Annotated[bool, typer.Option("--json", help="输出 JSON")] = False,
 ) -> None:
     """查看矛盾报告。"""
@@ -220,10 +275,47 @@ def report(
             return
         console.print(f"[bold]《{rep.title}》[/] 共 {len(rep.issues)} 个问题\n")
         for n, issue in enumerate(rep.issues, start=1):
-            console.print(f"{n}. {_CONFIDENCE_LABEL[issue.confidence]}  {issue.description}")
+            console.print(
+                f"{n}. {_CONFIDENCE_LABEL[issue.confidence]}  {escape(issue.description)}"
+                f"  [dim]#{str(issue.id)[:8]}[/]"
+            )
             for e in issue.evidence:
-                console.print(f"     [dim]第 {e.chapter_number} 章[/] 「{e.quote}」")
+                console.print(f"     [dim]第 {e.chapter_number} 章[/] 「{escape(e.quote)}」")
+            if issue.verification is not None:
+                console.print(f"     {_verdict_line(issue.verification)}")
+            else:
+                console.print("     [dim]校验：未核实（webfic verify）[/]")
             console.print()
+
+    _run(main)
+
+
+@app.command("verify")
+def verify_cmd(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    issue: Annotated[
+        list[str] | None,
+        typer.Option(help="只核实这个问题（报告里 # 后的编号，可只写前几位；可重复）"),
+    ] = None,
+    again: Annotated[bool, typer.Option(help="已有有效结论的也重新核实")] = False,
+) -> None:
+    """用校验 agent 回原文核实报告里的问题（真矛盾 / 误报 / 需作者确认）。"""
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        issue_ids = None
+        if issue:
+            async with factory() as session:
+                rep = await reports.get_report(
+                    session, user_id=settings.dev_user_id, book_id=book_id, include_closed=True
+                )
+            issue_ids = []
+            for prefix in issue:
+                matches = [i.id for i in rep.issues if str(i.id).startswith(prefix.lower())]
+                if len(matches) != 1:
+                    raise NotFound(f"找不到唯一匹配「{prefix}」的问题（匹配到 {len(matches)} 个）")
+                issue_ids.append(matches[0])
+        await _verify(settings, factory, book_id, issue_ids=issue_ids, again=again)
 
     _run(main)
 
@@ -259,8 +351,15 @@ def _print_change(result: chapters.ChangeResult) -> None:
         console.print("矛盾报告没有变化。")
 
 
-def _change(book: str, operation: Callable[..., Awaitable[chapters.ChangeResult]], **kwargs):
-    """Run a chapter operation with the platform LLM and print what changed."""
+def _change(
+    book: str,
+    operation: Callable[..., Awaitable[chapters.ChangeResult]],
+    *,
+    verify: bool,
+    **kwargs,
+):
+    """Run a chapter operation with the platform LLM and print what changed; then verify
+    the new issues, unless it was a dry run."""
 
     async def main(settings: Settings, factory: Factory) -> None:
         user_id = settings.dev_user_id
@@ -272,6 +371,8 @@ def _change(book: str, operation: Callable[..., Awaitable[chapters.ChangeResult]
                 archival=platform_archival(settings), **kwargs,
             )  # fmt: skip
         _print_change(result)
+        if verify and not result.dry_run:
+            await _verify(settings, factory, book_id)
 
     _run(main)
 
@@ -281,9 +382,10 @@ def append(
     book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
     file: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="新章节 txt")],
     dry_run: DryRun = False,
+    verify: Verify = True,
 ) -> None:
     """在作品末尾追加一章或多章。"""
-    _change(book, chapters.append_chapters, text=_read_text(file), dry_run=dry_run)
+    _change(book, chapters.append_chapters, text=_read_text(file), dry_run=dry_run, verify=verify)
 
 
 @app.command("replace-chapter")
@@ -292,11 +394,13 @@ def replace_chapter(
     number: Annotated[int, typer.Argument(help="章号（按导入后的顺序，从 1 开始）")],
     file: Annotated[Path, typer.Argument(exists=True, dir_okay=False, help="新正文 txt")],
     dry_run: DryRun = False,
+    verify: Verify = True,
 ) -> None:
     """用新正文替换第 N 章，并从第 N 章起重算。"""
     _change(
-        book, chapters.replace_chapter, number=number, content=_read_text(file), dry_run=dry_run
-    )
+        book, chapters.replace_chapter, number=number, content=_read_text(file),
+        dry_run=dry_run, verify=verify,
+    )  # fmt: skip
 
 
 @app.command("delete-chapter")
@@ -304,9 +408,10 @@ def delete_chapter(
     book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
     number: Annotated[int, typer.Argument(help="章号")],
     dry_run: DryRun = False,
+    verify: Verify = True,
 ) -> None:
     """删除第 N 章，后面的章节编号前移并重算。"""
-    _change(book, chapters.delete_chapter, number=number, dry_run=dry_run)
+    _change(book, chapters.delete_chapter, number=number, dry_run=dry_run, verify=verify)
 
 
 @app.command()
@@ -316,9 +421,13 @@ def patch(
     old: Annotated[str, typer.Argument(help="原片段（在这一章里必须唯一）")],
     new: Annotated[str, typer.Argument(help="新片段")],
     dry_run: DryRun = False,
+    verify: Verify = True,
 ) -> None:
     """把第 N 章里的一段原文改成新片段，并从第 N 章起重算。"""
-    _change(book, chapters.patch_chapter, number=number, old=old, new=new, dry_run=dry_run)
+    _change(
+        book, chapters.patch_chapter, number=number, old=old, new=new, dry_run=dry_run,
+        verify=verify,
+    )  # fmt: skip
 
 
 def _fmt_age(low: float | None, high: float | None) -> str:

@@ -318,3 +318,32 @@ class AgentStepRow(_Common, Base):
     output_tokens: Mapped[int] = mapped_column(default=0)
     cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))
     latency_ms: Mapped[int] = mapped_column(default=0)
+
+
+class IssueVerificationRow(_Common, Base):
+    """The verify agent's verdict on one issue. Valid while `key` still matches: the
+    issue, its quoted evidence and the chapters it quotes are unchanged. It never changes
+    the author's status on the issue; it only decides how the report shows it."""
+
+    __tablename__ = "issue_verifications"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    issue_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("consistency_issues.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(64))
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(String(24))  # the run's: done / budget_exhausted / ...
+    # contradiction / false_alarm / needs_author; None when the run gave no answer
+    verdict: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(String(16))
+    explanation: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(JsonType, default=list)
+    model: Mapped[str] = mapped_column(String(64))
+    prompt_version: Mapped[str] = mapped_column(String(32))
+    cost_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))

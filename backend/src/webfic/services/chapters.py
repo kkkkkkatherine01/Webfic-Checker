@@ -28,6 +28,7 @@ from webfic.db.models import (
     Book,
     Chapter,
     ChapterExtractionRow,
+    ChapterNoteRow,
     IssueRow,
     PassageRow,
 )
@@ -324,3 +325,95 @@ async def patch_chapter(
         factory, llm, settings, user_id=user_id, book_id=book_id, number=number,
         content=content.replace(old, new), dry_run=dry_run, archival=archival,
     )  # fmt: skip
+
+
+async def rescan_author_notes(
+    factory: Factory,
+    llm: LLMClient,
+    settings: Settings,
+    *,
+    user_id: uuid.UUID,
+    book_id: uuid.UUID,
+    markers: list[str] | None = None,
+    dry_run: bool = False,
+    archival: Archival | None = None,
+) -> ChangeResult:
+    """Look for the book's author's notes again — after the author registered their own
+    markers (`markers`, replacing the book's list), or for a book imported before notes
+    were recognised — and recompute from the first chapter whose story text changed.
+    Chapters whose story text is unchanged keep their stored extraction."""
+
+    async def edit(session: AsyncSession) -> tuple[int, list[str]]:
+        book = await _book(session, user_id, book_id)
+        if markers is not None:
+            book.author_note_markers = sorted({m.strip() for m in markers if m.strip()})
+        chapter_rows = (
+            await session.scalars(
+                select(Chapter)
+                .where(Chapter.user_id == user_id, Chapter.book_id == book_id)
+                .order_by(Chapter.number)
+            )
+        ).all()
+        first: int | None = None
+        with_notes = []
+        for chapter in chapter_rows:
+            scan = await imports.author_note_scan(
+                session, llm, user_id=user_id, book_id=book_id, chapter=chapter,
+                markers=list(book.author_note_markers or []),
+            )  # fmt: skip
+            if scan.ranges:
+                with_notes.append(chapter.number)
+            start, end = scan.story(chapter.content)
+            story_hash = hashlib.sha256(chapter.content[start:end].encode()).hexdigest()
+            stored = await session.scalar(
+                select(ChapterExtractionRow.content_hash).where(
+                    ChapterExtractionRow.user_id == user_id,
+                    ChapterExtractionRow.chapter_id == chapter.id,
+                )
+            )
+            if first is None and chapter.status == "extracted" and stored != story_hash:
+                first = chapter.number
+        listed = "、".join(str(n) for n in with_notes) or "无"
+        warnings = [f"识别到作者的话的章节：{listed}"]
+        if first is None:
+            return (chapter_rows[-1].number + 1 if chapter_rows else 1), warnings
+        await imports.reset_from(session, user_id=user_id, book_id=book_id, number=first)
+        await imports.mark_pending(session, user_id=user_id, book_id=book_id, number=first)
+        return first, warnings
+
+    return await _apply(
+        factory,
+        llm,
+        settings,
+        user_id=user_id,
+        book_id=book_id,
+        edit=edit,
+        dry_run=dry_run,
+        archival=archival,
+    )
+
+
+class NoteView(BaseModel):
+    chapter_number: int
+    char_start: int
+    char_end: int
+    text: str
+
+
+async def author_notes(
+    session: AsyncSession, *, user_id: uuid.UUID, book_id: uuid.UUID
+) -> tuple[list[str], list[NoteView]]:
+    """The book's registered markers and the author's notes found so far."""
+    book = await _book(session, user_id, book_id)
+    rows = await session.execute(
+        select(Chapter.number, Chapter.content, ChapterNoteRow.ranges)
+        .join(ChapterNoteRow, ChapterNoteRow.chapter_id == Chapter.id)
+        .where(Chapter.user_id == user_id, Chapter.book_id == book_id)
+        .order_by(Chapter.number)
+    )
+    notes = [
+        NoteView(chapter_number=number, char_start=a, char_end=b, text=content[a:b])
+        for number, content, ranges in rows
+        for a, b in ranges
+    ]
+    return list(book.author_note_markers or []), notes

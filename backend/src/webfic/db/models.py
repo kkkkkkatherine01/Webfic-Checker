@@ -38,6 +38,10 @@ class Book(_Common, Base):
 
     user_id: Mapped[uuid.UUID] = mapped_column(index=True)
     title: Mapped[str] = mapped_column(Text)
+    # The author's own markers for author's notes ("Note"), besides the built-in ones.
+    author_note_markers: Mapped[list[str]] = mapped_column(
+        JsonType, default=list, server_default="[]"
+    )
 
 
 class Chapter(_Common, Base):
@@ -148,6 +152,26 @@ class ChapterExtractionRow(_Common, Base):
     content_hash: Mapped[str] = mapped_column(String(64))  # of the chapter text read
     version: Mapped[str] = mapped_column(String(32))  # prompt and chunking used
     result: Mapped[dict[str, Any]] = mapped_column(JsonType)
+
+
+class ChapterNoteRow(_Common, Base):
+    """Where a chapter's author's notes are (webfic.extraction.author_notes): ranges of
+    the chapter text left out of extraction. Reused while the chapter text and the scan
+    setup (prompt, the book's markers) are unchanged."""
+
+    __tablename__ = "chapter_notes"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(index=True)
+    book_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("books.id", ondelete="CASCADE"), index=True
+    )
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), unique=True
+    )
+    content_hash: Mapped[str] = mapped_column(String(64))
+    version: Mapped[str] = mapped_column(String(16))
+    ranges: Mapped[list[list[int]]] = mapped_column(JsonType)
+    model_used: Mapped[bool] = mapped_column(default=True)
 
 
 EMBEDDING_DIM = 512  # BAAI/bge-small-zh-v1.5

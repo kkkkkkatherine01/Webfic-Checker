@@ -195,3 +195,22 @@ async def test_run_injection_end_to_end(factory):
     assert rows["control_consistent"].false_alarm.value == 0.0
     assert rows["control_future"].taken_as_advance.value == 1.0
     assert rows["control_future"].false_alarm.value == 1.0
+
+
+def test_idiomatic_and_hearsay_ages_are_not_used():
+    # Step 4.5: "年才半百" is not an exact 50, and an age inside hearsay may be wrong on
+    # purpose; an injected contradiction built on either may be none.
+    idiom = "林远年才半百，在山上练剑。\n师父看着他。"
+    hearsay = "听说林远今年十八岁，在山上练剑。\n师父看着他。"
+    for ch1, raw in [(idiom, "林远年才半百"), (hearsay, "林远今年十八岁")]:
+        ages = [fact(1, ch1, raw, 50 if "半百" in raw else 18), fact(3, CH3, "林远今年二十岁", 20)]
+        v = view(ages=ages)
+        v.chapters[1] = ch1
+        assert candidates(v, "modify_backwards", random.Random(0)) == []
+        assert {i.ref[0] for i in candidates(v, "insert_backwards", random.Random(0))} == {3}
+    # Nor is an injection put on a line of hearsay.
+    ch2 = "又过了两年。\n据说林远下山了。"
+    v = view()
+    v.chapters[2] = ch2
+    found = candidates(v, "insert_backwards", random.Random(0))
+    assert all(i.old != "据说林远下山了。" for i in found)

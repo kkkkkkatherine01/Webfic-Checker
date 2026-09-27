@@ -30,6 +30,12 @@ def _normalize_with_map(text: str) -> tuple[str, list[int]]:
     return "".join(chars), index_map
 
 
+def normalized(text: str) -> str:
+    """The text as quotes are compared: width variants folded, spaces and punctuation
+    dropped, lower case."""
+    return _normalize_with_map(text)[0]
+
+
 def locate(haystack: str, needle: str, start_from: int = 0) -> tuple[int, int] | None:
     """Return (start, end) offsets in `haystack`, or None if not found.
 

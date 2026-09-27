@@ -17,18 +17,39 @@ def make_llm(backend, factory, *, user_id, book_id) -> JsonLLMClient:
     return JsonLLMClient(backend, tiers, store=store)
 
 
+def is_note_scan(messages) -> bool:
+    """An author's-note scan (step 4.5), sent before each chapter's extraction."""
+    return messages[0].content.startswith(NOTE_PROMPT_START)
+
+
+NOTE_PROMPT_START = "你负责区分网络小说章节里的"
+
+
 class FakeBackend:
-    """Answers with `respond(messages)`; counts real (non-cached) calls."""
+    """Answers with `respond(messages)`; counts real (non-cached) calls. Author's-note
+    scans are answered "all story" unless `notes` is given, and kept apart in
+    `note_calls`, so tests about extraction count extraction calls only."""
 
     provider = "fake"
 
-    def __init__(self, respond: Callable[[list[ChatMessage]], str | dict[str, Any]]):
+    def __init__(
+        self,
+        respond: Callable[[list[ChatMessage]], str | dict[str, Any]],
+        notes: Callable[[list[ChatMessage]], str | dict[str, Any]] | None = None,
+    ):
         self._respond = respond
+        self._notes = notes
         self.calls: list[list[ChatMessage]] = []
+        self.note_calls: list[list[ChatMessage]] = []
 
     async def chat(
         self, *, model, messages, json_mode, extra=None, temperature=None, tools=None
     ) -> RawCompletion:
+        if is_note_scan(messages):
+            self.note_calls.append(list(messages))
+            answer = self._notes(messages) if self._notes else {"paragraphs": []}
+            text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+            return RawCompletion(text=text, usage=Usage(300, 0, 20), model=model)
         self.calls.append(list(messages))
         answer = self._respond(messages)
         text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)

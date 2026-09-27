@@ -70,11 +70,25 @@ PER_BOOK = 3  # at most this many injections of one kind in one book...
 PER_BOOK_BY_KIND = {
     "modify_backwards": 5, "modify_jump": 5, "control_future": 5, "control_future_new": 5,
 }  # fmt: skip
-FUTURE_PER_PAIR = 3
-# Words that make an age approximate or a bound; anchors quoting them are not used.
+FUTURE_PER_PAIR = 3  # a future duration can go on any line between two ages
+# Ages that do not make a sound anchor or target (steps 4-3 and 4.5): an approximate age
+# extracted as an exact number, an idiomatic one ("年才半百"), or one inside hearsay
+# ("听说她才十五岁") — an "injected contradiction" there may be none.
 _APPROXIMATE = re.compile(
     r"超过|多|余|出头|左右|来岁|上下|约|大概|几|将近|差不多|快|不到|未满|年近|年过"
-)  # a future duration can go on any line between two ages
+)
+_IDIOMATIC = re.compile(r"半百|而立|不惑|知天命|花甲|古稀|耄耋|弱冠|及笄|豆蔻|总角|垂髫|耳顺")
+_HEARSAY = re.compile(r"听说|据说|传闻|传言|听人说|有人说|据闻|风闻|谣传")
+_SENTENCE_END = re.compile(r"[。！？!?\n]")
+
+
+def _sentence(content: str, start: int, end: int) -> str:
+    """The sentence around [start, end)."""
+    begin = max((m.end() for m in _SENTENCE_END.finditer(content, 0, start)), default=0)
+    stop = _SENTENCE_END.search(content, end)
+    return content[begin : stop.end() if stop else len(content)]
+
+
 SEED = 20260926
 MAX_AGE = 150
 
@@ -347,6 +361,7 @@ def _insertion_points(
                 and (number, start) >= (after.chapter_number, after.char_end)  # a later line
                 and (before is None or pos < _pos(before))
                 and content.count(line) == 1
+                and not _HEARSAY.search(line)
             ):
                 name = next((n for n in usable if n in line), names[0] if any_line else None)
                 if name:
@@ -415,9 +430,11 @@ def candidates(view: BookView, kind: str, rng: random.Random) -> list[Injection]
             and fact.value is not None
             and 1 <= fact.value <= MAX_AGE
             and (fact.value_max is None or fact.value_max <= MAX_AGE)
-            # An approximate age ("已经超过百岁") extracted as an exact number would make
-            # an "injected contradiction" that is none (step 4-3: 107 is over a hundred).
             and not _APPROXIMATE.search(fact.raw_text)
+            and not _IDIOMATIC.search(fact.raw_text)
+            and not _HEARSAY.search(
+                _sentence(view.chapters[fact.chapter_number], fact.char_start, fact.char_end)
+            )
         )
         if usable and _is_comparable(fact):
             by_character.setdefault(fact.character_id, []).append(fact)

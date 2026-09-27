@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from webfic.archival.index import Archival, character_names
 from webfic.archival.passages import sentence_ends
 from webfic.db.models import EMBEDDING_DIM, Book, Chapter, CharacterAlias, PassageRow
+from webfic.extraction.locator import normalized
 from webfic.memory.recall import ChapterRange, find_character
 from webfic.services.errors import NotFound
 
@@ -29,6 +30,8 @@ Mode = Literal["hybrid", "vector", "keyword"]
 
 CANDIDATES = 50  # taken from each ranking before fusion
 RRF_K = 60  # the usual reciprocal-rank-fusion constant
+# Queries at least this long (punctuation and spaces aside) are treated as possible quotes.
+QUOTE_MIN_CHARS = 6
 
 
 class PassageHit(BaseModel):
@@ -37,7 +40,7 @@ class PassageHit(BaseModel):
     char_end: int
     text: str
     score: float  # fused score; only comparable within one search
-    matched_by: list[str]  # "vector", "keyword" or both
+    matched_by: list[str]  # "vector", "keyword", "exact" (contains the query itself)
 
 
 class PassageText(BaseModel):
@@ -168,7 +171,10 @@ async def search_text(
         for place, passage_id in enumerate(ranking, start=1):
             fused[passage_id] = fused.get(passage_id, 0.0) + 1 / (RRF_K + place)
             matched.setdefault(passage_id, []).append(label)
-    best = sorted(fused, key=lambda i: -fused[i])[:k]
+    exact = await _containing_query(session, filters, user_id, query, fused, matched, mode)
+    # Passages containing the query word for word come first: checking a quote is the
+    # most common search an agent makes, and a tie in the fused score could bury it.
+    best = sorted(fused, key=lambda i: (i not in exact, -fused[i]))[:k]
     rows = {
         r.id: r
         for r in await session.scalars(
@@ -186,6 +192,40 @@ async def search_text(
         )
         for i in best
     ]
+
+
+async def _containing_query(
+    session: AsyncSession,
+    filters: list,
+    user_id: uuid.UUID,
+    query: str,
+    fused: dict[uuid.UUID, float],
+    matched: dict[uuid.UUID, list[str]],
+    mode: Mode,
+) -> set[uuid.UUID]:
+    """The candidate passages that contain the query itself (ignoring punctuation and
+    spacing), for queries that look like a quote. Passages containing it verbatim are
+    added to the candidates even if neither ranking found them."""
+    wanted = normalized(query)
+    if mode != "hybrid" or len(wanted) < QUOTE_MIN_CHARS:
+        return set()
+    literal = await session.scalars(
+        select(PassageRow.id)
+        .where(*filters, PassageRow.text.contains(query.strip(), autoescape=True))
+        .limit(CANDIDATES)
+    )
+    for passage_id in literal:
+        fused.setdefault(passage_id, 0.0)
+        matched.setdefault(passage_id, [])
+    rows = await session.execute(
+        select(PassageRow.id, PassageRow.text).where(
+            PassageRow.user_id == user_id, PassageRow.id.in_(list(fused))
+        )
+    )
+    exact = {passage_id for passage_id, text in rows if wanted in normalized(text)}
+    for passage_id in exact:
+        matched[passage_id].append("exact")
+    return exact
 
 
 async def read_passage(

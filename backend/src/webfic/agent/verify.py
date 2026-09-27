@@ -12,9 +12,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from webfic.agent.tools import RunState, Tool, ToolArgs, ToolContext, ToolRegistry
-from webfic.db.models import Chapter, FactRow
+from webfic.db.models import Chapter, ChapterNoteRow, FactRow
 from webfic.extraction.locator import locate
 from webfic.memory import archival as archival_memory
 from webfic.memory import core, recall
@@ -92,6 +93,13 @@ async def read_passage(ctx: ToolContext, args: ReadPassageArgs) -> str:
             start=args.start, end=end, context=context,
         )  # fmt: skip
     cut = f"（请求的范围超过 {MAX_SPAN} 字，只返回前 {MAX_SPAN} 字）" if end < args.end else ""
+    async with ctx.factory() as session:
+        notes = (await _note_ranges(session, ctx, [shown.chapter_number])).get(
+            shown.chapter_number, []
+        )
+    inside = [(a, b) for a, b in notes if a < shown.char_end and shown.char_start < b]
+    if inside:
+        cut += "（其中 " + "、".join(f"{a}–{b}" for a, b in inside) + " 是作者的话，不是正文）"
     t = shown.text
     marked = t[: shown.focus_start] + "【" + t[shown.focus_start : shown.focus_end] + "】"
     return (
@@ -113,6 +121,7 @@ class PassageBrief(BaseModel):
     start: int
     end: int
     text: str
+    author_note: bool = False  # the passage lies in the author's notes, not the story
 
 
 async def search_text(ctx: ToolContext, args: SearchTextArgs) -> list[PassageBrief]:
@@ -126,7 +135,15 @@ async def search_text(ctx: ToolContext, args: SearchTextArgs) -> list[PassageBri
             session, ctx.archival, user_id=ctx.user_id, book_id=ctx.book_id, query=args.query,
             k=args.k, character=args.character, chapters=chapters,
         )  # fmt: skip
-    return [PassageBrief(chapter=h.chapter_number, start=h.char_start, end=h.char_end, text=h.text)
+        notes = await _note_ranges(session, ctx, [h.chapter_number for h in hits])
+
+    def noted(h) -> bool:
+        return any(
+            a <= h.char_start and h.char_end <= b for a, b in notes.get(h.chapter_number, [])
+        )
+
+    return [PassageBrief(chapter=h.chapter_number, start=h.char_start, end=h.char_end, text=h.text,
+                         author_note=noted(h))
             for h in hits]  # fmt: skip
 
 
@@ -218,6 +235,22 @@ async def list_time_spans(ctx: ToolContext, args: SpansArgs) -> list[SpanBrief] 
         for s in spans
     ]  # fmt: skip
     return _limited(briefs)
+
+
+async def _note_ranges(
+    session: AsyncSession, ctx: ToolContext, numbers: list[int]
+) -> dict[int, list[tuple[int, int]]]:
+    """The author's-note ranges of some chapters (step 4.5)."""
+    rows = await session.execute(
+        select(Chapter.number, ChapterNoteRow.ranges)
+        .join(ChapterNoteRow, ChapterNoteRow.chapter_id == Chapter.id)
+        .where(
+            Chapter.user_id == ctx.user_id,
+            Chapter.book_id == ctx.book_id,
+            Chapter.number.in_(sorted(set(numbers))),
+        )
+    )
+    return {number: [(a, b) for a, b in ranges] for number, ranges in rows}
 
 
 # --- the verdict ---------------------------------------------------------------------------

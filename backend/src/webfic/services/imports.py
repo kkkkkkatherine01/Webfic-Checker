@@ -19,12 +19,15 @@ from webfic.db.models import (
     Book,
     Chapter,
     ChapterExtractionRow,
+    ChapterNoteRow,
     Character,
     CharacterAlias,
     CharacterStateRow,
     ElapsedTimeFactRow,
     FactRow,
 )
+from webfic.extraction.author_notes import NoteScan, find_author_notes
+from webfic.extraction.author_notes import version as note_version
 from webfic.extraction.extractor import (
     dump_extraction,
     extract_chapter,
@@ -73,6 +76,7 @@ class ImportJobResult(BaseModel):
     llm_calls: int
     cache_hits: int
     reused: int = 0  # chapters whose stored extraction was reused (no model call)
+    note_calls: int = 0  # model calls looking for author's notes (cost included in cost_usd)
     # A chapter that had failed was followed by extracted ones, so everything from it on
     # was recomputed in order (see run_import_job).
     recomputed_from: int | None = None
@@ -172,6 +176,47 @@ async def mark_pending(
     )
 
 
+async def author_note_scan(
+    session: AsyncSession,
+    llm: LLMClient | None,
+    *,
+    user_id: uuid.UUID,
+    book_id: uuid.UUID,
+    chapter: Chapter,
+    markers: list[str],
+) -> NoteScan:
+    """The chapter's author's notes: the stored scan while the chapter text and the scan
+    setup are unchanged, else a new scan, stored when the model took part (a scan by
+    markers only, after a model failure, is tried again next time)."""
+    tag = note_version(markers)
+    stored = await session.scalar(
+        select(ChapterNoteRow).where(
+            ChapterNoteRow.user_id == user_id, ChapterNoteRow.chapter_id == chapter.id
+        )
+    )
+    if stored is not None and stored.content_hash == chapter.content_hash and stored.version == tag:
+        return NoteScan(ranges=[(a, b) for a, b in stored.ranges], model_used=stored.model_used)
+    scan = await find_author_notes(llm, chapter.content, markers)
+    # Updated in place, not deleted and re-added: a flush here would hold the database's
+    # write lock (SQLite) while the extraction's model calls are being recorded.
+    ranges = [list(r) for r in scan.ranges]
+    if not scan.model_used:
+        if stored is not None:
+            await session.delete(stored)
+    elif stored is not None:
+        stored.content_hash, stored.version, stored.ranges = chapter.content_hash, tag, ranges
+        stored.model_used = True
+    else:
+        session.add(
+            ChapterNoteRow(
+                user_id=user_id, book_id=book_id, chapter_id=chapter.id,
+                content_hash=chapter.content_hash, version=tag, ranges=ranges,
+                model_used=True,
+            )
+        )  # fmt: skip
+    return scan
+
+
 async def _index(
     session: AsyncSession,
     archival: Archival,
@@ -224,6 +269,7 @@ async def run_import_job(
         book = await session.scalar(select(Book).where(Book.id == book_id, Book.user_id == user_id))
         if book is None:
             raise NotFound(f"book {book_id}")
+        markers = list(book.author_note_markers or [])
         not_extracted = (
             Chapter.user_id == user_id,
             Chapter.book_id == book_id,
@@ -283,9 +329,20 @@ async def run_import_job(
                 )
             )
             try:
+                # Author's notes are left out: only the story between them is extracted,
+                # and a stored extraction is reused while that text is unchanged.
+                scan = await author_note_scan(
+                    session, llm, user_id=user_id, book_id=book_id, chapter=chapter,
+                    markers=markers,
+                )  # fmt: skip
+                result.note_calls += scan.llm_calls
+                result.cost_usd += scan.cost_usd
+                story_start, story_end = scan.story(chapter.content)
+                story = chapter.content[story_start:story_end]
+                story_hash = hashlib.sha256(story.encode()).hexdigest()
                 if (
                     stored is not None
-                    and stored.content_hash == chapter.content_hash
+                    and stored.content_hash == story_hash
                     and stored.version == version
                 ):
                     extraction = load_extraction(stored.result)
@@ -294,11 +351,12 @@ async def run_import_job(
                     extraction = await extract_chapter(
                         llm,
                         chapter_number=number,
-                        text=chapter.content,
+                        text=story,
                         known_characters=index.for_prompt(),
                         system_prompt=system_prompt,
                         chunk_size=settings.chunk_size,
                         chunk_overlap=settings.chunk_overlap,
+                        offset=story_start,
                     )
                     if stored is not None:
                         await session.delete(stored)
@@ -306,7 +364,7 @@ async def run_import_job(
                     session.add(
                         ChapterExtractionRow(
                             user_id=user_id, book_id=book_id, chapter_id=chapter_id,
-                            content_hash=chapter.content_hash, version=version,
+                            content_hash=story_hash, version=version,
                             result=dump_extraction(extraction),
                         )
                     )  # fmt: skip

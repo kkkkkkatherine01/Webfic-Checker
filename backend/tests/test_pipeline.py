@@ -113,7 +113,8 @@ async def test_full_pipeline(factory):
 
     async with factory() as session:
         usage = await reports.get_usage(session, user_id=USER, book_id=job.book_id)
-    assert sum(line.calls for line in usage.lines) == 3
+    calls = {line.purpose: line.calls for line in usage.lines}
+    assert (calls["extract.age"], calls["extract.author_notes"]) == (3, 3)
     assert usage.total_cost_usd > 0
 
 

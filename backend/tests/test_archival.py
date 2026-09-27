@@ -203,3 +203,20 @@ async def test_names_known_later_are_found_in_earlier_chapters(factory, tmp_path
     await world.load("第1章 起\n宇智波鼬站在门口。\n第2章 承\n宇智波鼬今年21岁。\n")
     hits = await search(world, "宇智波鼬", mode="keyword")
     assert {h.chapter_number for h in hits} == {1, 2}
+
+
+# --- quotes first (step 4.5) ----------------------------------------------------------------
+
+
+async def test_a_passage_containing_the_quote_comes_first(world):
+    hits = await search(world, "林远今年21岁。", k=4)
+    assert "林远今年21岁" in hits[0].text and "exact" in hits[0].matched_by
+    # Punctuation and spacing do not matter; short queries (names) are not quotes.
+    hits = await search(world, "林远 今年 16 岁", k=4)
+    assert "林远今年16岁" in hits[0].text and "exact" in hits[0].matched_by
+    assert all("exact" not in h.matched_by for h in await search(world, "林远", k=4))
+
+
+async def test_only_the_hybrid_mode_puts_quotes_first(world):
+    hits = await search(world, "林远今年21岁。", k=4, mode="vector")
+    assert all("exact" not in h.matched_by for h in hits)

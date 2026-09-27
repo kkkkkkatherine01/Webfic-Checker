@@ -172,7 +172,10 @@ async def extract_chapter(
     system_prompt: str,
     chunk_size: int,
     chunk_overlap: int,
+    offset: int = 0,
 ) -> ChapterExtraction:
+    """Extract from `text`; positions are reported as `offset` + position in `text`
+    (the text may be the chapter without its author's notes)."""
     result = ChapterExtraction()
     chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
     # A statement is sometimes listed twice, and chunks overlap, so one near a cut is
@@ -213,7 +216,7 @@ async def extract_chapter(
             if span is None or s.generic or not _valid_age(s):
                 result.dropped.append(s.raw_text)
                 continue
-            start, end = span[0] + chunk.start, span[1] + chunk.start
+            start, end = span[0] + chunk.start + offset, span[1] + chunk.start + offset
             key = (start, end, s.statement_type)
             people = in_chunk.setdefault(key, set())
             person = (s.resolved_name or s.mention).strip()
@@ -233,7 +236,7 @@ async def extract_chapter(
             if span is None:
                 result.dropped.append(e.raw_text)
                 continue
-            start, end = span[0] + chunk.start, span[1] + chunk.start
+            start, end = span[0] + chunk.start + offset, span[1] + chunk.start + offset
             if (start, end) in seen_elapsed:
                 continue
             seen_elapsed.add((start, end))

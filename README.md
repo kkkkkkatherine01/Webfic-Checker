@@ -1,6 +1,6 @@
 # Webfic Checker
 
-A consistency checker for Chinese web novels (网文). It reads a novel chapter by
+A consistency checker for Chinese web novels. It reads a novel chapter by
 chapter, extracts what the text states about characters and the passage of story time,
 and flags contradictions — "18 in chapter 3, then 16 two years later" — for the author to
 review. A verification agent then goes back to the text and dismisses the reports that
@@ -21,12 +21,13 @@ measurable.
 | What | How it is measured | Result |
 |---|---|---|
 | **Verification agent, real reports** (held out) | 22 contradiction reports on real novels, labelled by hand; 3 runs each | **97% correct**; the 19 false alarms dismissed in 56 of 57 runs (the other ran out of turns and stayed visible); the author's report goes from 22 items to 1–2, keeping the one real candidate every time |
-| Verification agent, real contradictions | 47 contradictions (test stories + contradictions injected into real novels); 3 runs | 93% kept (6% wrongly dismissed — about half of those are injected test cases the text itself marks as unreliable) |
+| Verification agent, real contradictions | 49 contradictions (test stories + contradictions injected into real novels); 3 runs | 91% kept; of the 9% dismissed, about 2 points are agent errors — the rest are injected cases that turn out not to be contradictions (an age that is part of an epithet, a generic phrase, a lie in the plot) |
 | Verification agent, false alarms | 73 false alarms made by corrupting stored extraction results without touching the text; 3 runs | **100% dismissed** |
 | Long chapters (9–18k characters) | the same novels with every three chapters merged | no degradation: 100% / 100% on the two sets above; 98% of stated ages still extracted |
 | Age extraction on real text | 20 hand-annotated chapters from 19 novels, 5 samples | recall 99%, precision 92%, traps passed 96% |
 | Contradiction detection | 88 contradictions injected into 100 real novels | 85% detected (90% on an earlier sample), every confidence level right; 0 false reports on 122 control edits |
-| Passage retrieval | own test stories / 24 annotated DetectiveQA novels | hit@5 100% / clue statements hit@5 73%, hit@10 81% |
+| Passage retrieval | own test stories / 24 annotated DetectiveQA novels | hit@5 100% / clue statements hit@5 74%, hit@10 82% |
+| Author's notes | 66 notes written for the evaluation, attached to real chapters; 15 story passages that address the reader; 980 unmodified chapters | 97% of notes recognised with exact boundaries; 0 of 15 story passages taken for notes; 0.08% of real paragraphs flagged (checked by hand) |
 | Cost | DeepSeek, platform prices | extraction ≈ $0.25–0.3 per million characters; verification ≈ $0.003 per report |
 
 The numbers, and how each was reached, are discussed in [Evaluation](#evaluation).
@@ -36,7 +37,8 @@ The numbers, and how each was reached, are discussed in [Evaluation](#evaluation
 ```mermaid
 flowchart LR
     T[".txt novel"] --> S["Split into chapters<br/>(numbering-aware)"]
-    S --> E["LLM extraction<br/>JSON + schema check<br/>+ code guardrails"]
+    S --> A["Author's notes<br/>set aside"]
+    A --> E["LLM extraction<br/>JSON + schema check<br/>+ code guardrails"]
     E --> M[("Memory<br/>Core · Recall · Archival")]
     M --> C["Rule checker<br/>(age arithmetic over story time)"]
     C --> V["Verification agent<br/>reads the text, keeps or dismisses"]
@@ -48,6 +50,13 @@ flowchart LR
    not by length or a single regex, so "第一回合比赛，开始！" in the middle of a chapter
    stays body text while "第一卷 第七章 浮游世界" and author typos in chapter numbers
    are handled (checked on 100 WebNovelBench novels).
+   **Author's notes** (update notices, thanks, setting explanations) are set aside
+   before extraction. Authors mark them in their own ways or not at all, so the model
+   labels each paragraph near the start and end of a chapter as story or author;
+   common markers ("作者有话说", "PS") and markers an author registers for their book
+   (`--marker Note`) are recognised in code, and code keeps notes to a run at either
+   end. The chapter text itself is untouched; the verification agent is told which part
+   of a passage is a note.
 2. **Extraction.** A cheap model (`deepseek-flash`, thinking off, temperature 0) reads
    each chapter in ≤8,000-character chunks and returns ages, time spans and revealed
    real names as JSON, validated with Pydantic and retried with the error message on
@@ -146,6 +155,7 @@ cache, and replay from the cache for re-scoring without cost.
 | `verify` | Does the verification agent keep real contradictions and dismiss false ones? | Real contradictions (test stories + injections); false alarms made by corrupting stored extraction results while leaving the text alone (a flashback marked as present, a guess marked as fact, an age moved to another character…); 22 hand-labelled real reports, held out |
 | `long-chapters` | Does anything break on 10,000-character chapters? | The same novels with every three chapters merged |
 | `retrieval` | Does search find the right passage? | Questions on the test stories; DetectiveQA's annotated clues |
+| `author-notes` | Are author's notes set aside, and story text left alone? | Notes written for the evaluation (marked, custom-marked, unmarked, multi-paragraph, one-liners) and story passages that address the reader, attached to real chapters; every flagged paragraph in 980 unmodified chapters, for review by hand |
 
 Some things the evaluations caught, that unit tests with a fake model could not:
 
@@ -179,7 +189,7 @@ docker compose up -d postgres     # Postgres 16 with pgvector
 cd backend
 uv sync
 uv run alembic upgrade head
-uv run pytest                     # 280 tests, no API calls
+uv run pytest                     # 296 tests, no API calls
 ```
 
 On Windows, run the CLI with `PYTHONUTF8=1`.
@@ -193,6 +203,7 @@ uv run webfic patch <book> 12 "十六岁" "十八岁" --dry-run   # what would a
 uv run webfic append <book> new.txt       # add chapters (also replace-chapter, delete-chapter)
 uv run webfic character <book> 林远       # a character's state, as of any chapter
 uv run webfic search <book> "林远 拜师"   # passage search
+uv run webfic author-notes <book> --marker Note   # register a marker, rescan notes
 uv run webfic usage <book>                # tokens and cost
 ```
 
@@ -203,7 +214,8 @@ Books, runs and issues can be referred to by a unique prefix of their id.
 ```
 backend/src/webfic/
   ingest/        chapter splitting, chunking
-  extraction/    prompts (versioned), extractor, quote locator, character resolver
+  extraction/    prompts (versioned), extractor, author's notes, quote locator,
+                 character resolver
   memory/        Core state and snapshots, change log, Recall and Archival queries
   archival/      passages, local embeddings, jieba keywords, indexing
   checkers/      age arithmetic checker

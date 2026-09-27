@@ -430,6 +430,42 @@ def patch(
     )  # fmt: skip
 
 
+@app.command("author-notes")
+def author_notes_cmd(
+    book: Annotated[str, typer.Argument(help="作品 ID（可只写前几位）")],
+    marker: Annotated[
+        list[str] | None,
+        typer.Option(help="作者自己的标记，如 Note（可重复；给出时替换这部作品原有的标记）"),
+    ] = None,
+    show: Annotated[bool, typer.Option(help="只列出已识别的作者的话，不重新识别")] = False,
+    dry_run: DryRun = False,
+    verify: Verify = True,
+) -> None:
+    """识别作者的话（章首 / 章末写给读者的话），不作为正文抽取；从第一处变化的章节起重算。"""
+    if not show:
+        _change(book, chapters.rescan_author_notes, markers=marker, dry_run=dry_run, verify=verify)
+        if dry_run:
+            return
+
+    async def main(settings: Settings, factory: Factory) -> None:
+        book_id = await _resolve_book(factory, settings.dev_user_id, book)
+        async with factory() as session:
+            markers, notes = await chapters.author_notes(
+                session, user_id=settings.dev_user_id, book_id=book_id
+            )
+        console.print(f"\n作者自定义的标记：{escape('、'.join(markers)) or '无'}")
+        if not notes:
+            console.print("没有识别到作者的话。")
+        for n in notes:
+            text = n.text.replace("\n", " ")
+            preview = text if len(text) <= 60 else text[:60] + "…"
+            console.print(
+                f"  第 {n.chapter_number} 章 {n.char_start}–{n.char_end}：{escape(preview)}"
+            )
+
+    _run(main)
+
+
 def _fmt_age(low: float | None, high: float | None) -> str:
     if low is None:
         return "—"
@@ -512,7 +548,9 @@ def search(
         if not hits:
             console.print("没有找到相关段落（这部作品可能还没建检索索引：webfic reindex）。")
         for n, hit in enumerate(hits, start=1):
-            via = "+".join({"vector": "向量", "keyword": "关键词"}[m] for m in hit.matched_by)
+            via = "+".join(
+                {"vector": "向量", "keyword": "关键词", "exact": "原句"}[m] for m in hit.matched_by
+            )
             console.print(
                 f"{n}. [dim]第 {hit.chapter_number} 章 {hit.char_start}–{hit.char_end}"
                 f"（{via}）[/]\n   {hit.text.replace(chr(10), ' ')}"

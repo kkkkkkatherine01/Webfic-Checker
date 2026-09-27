@@ -1001,5 +1001,95 @@ def long_chapters_cmd(
     console.print(f"\n结果已保存：{path}")
 
 
+@app.command("author-notes")
+def author_notes_cmd(
+    originals: Annotated[
+        bool, typer.Option(help="同时在约 1000 章原文上统计误判（约 $0.2，之后走缓存）")
+    ] = True,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "author-notes",
+) -> None:
+    """作者的话（4.5）：写好的作者注接到真实章节首尾能否识别，正文会不会被误判。"""
+    import html
+    import json
+
+    from webfic.evaluation import author_notes_eval as an
+    from webfic.llm.cache import DbCallStore
+
+    settings = get_settings()
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    cases = an.build_cases(EVAL_DIR)
+
+    async def main():
+        # No database: the scans only need the model (and the eval cache).
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+        llm = platform_client(settings, _LayeredStore(DbCallStore(cache, user_id=None)))
+        results = await an.run_cases(llm, cases)
+        originals_score = None
+        if originals:
+            originals_score = await an.run_originals(
+                llm, EVAL_DIR / "external",
+                on_progress=lambda d, t: console.print(f"  原文 [{d}/{t}]"),
+            )  # fmt: skip
+        return results, originals_score
+
+    results, originals_score = asyncio.run(main())
+    table = Table("类型", "条数", "识别出（作者注）", "边界准确", "误判（正文）", title="作者的话")
+    for sc in an.score(results):
+        table.add_row(sc.group, str(sc.cases), str(sc.found), str(sc.exact), str(sc.touched))
+    console.print(table)
+    missed = [r for r in results if r.case.kind == "note" and not r.found]
+    wrong = [r for r in results if (r.case.kind == "story" and r.touched) or r.story_lost]
+    for title, items in (("没识别出的作者注", missed), ("误判或多带了正文", wrong)):
+        if items:
+            console.print(f"\n[bold]{title}[/]")
+            for r in items:
+                console.print(
+                    f"  {r.case.id}（{r.case.position}，{r.case.chapter}）："
+                    f"{r.case.content[slice(*r.case.span)][:40]}  多带正文 {r.story_lost} 字"
+                )
+    report = {
+        "label": label,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "scores": [sc.model_dump(mode="json") for sc in an.score(results)],
+        "results": [
+            {"case": r.case.id, "found": r.found, "touched": r.touched,
+             "story_lost": r.story_lost, "ranges": r.ranges}
+            for r in results
+        ],
+    }  # fmt: skip
+    if originals_score is not None:
+        o = originals_score
+        rate = Ratio(num=o.paragraphs_flagged, den=o.paragraphs_examined)
+        console.print(
+            f"\n原文 {o.chapters} 章：被判为作者的话的段落 {rate}（章首 / 章末共 "
+            f"{o.paragraphs_examined} 段），涉及 {o.chapters_flagged} 章"
+        )
+        report["originals"] = o.model_dump(mode="json", exclude={"flagged"})
+        report["originals"]["flagged"] = [f.model_dump(mode="json") for f in o.flagged]
+        page = EVAL_DIR / "author_notes" / "flagged.html"
+        rows = "".join(
+            f"<section><h2>{html.escape(f.chapter)} {f.range[0]}–{f.range[1]}</h2>"
+            f"<pre>{html.escape(f.text)}</pre></section>"
+            for f in o.flagged
+        )
+        page.write_text(
+            "<!doctype html><meta charset='utf-8'><title>被判为作者的话的原文段落</title>"
+            "<style>body{font:15px/1.7 system-ui;max-width:900px;margin:auto;padding:16px}"
+            "pre{white-space:pre-wrap;background:#f6f6f6;padding:8px}</style>"
+            f"<h1>原文里被判为作者的话的部分（{len(o.flagged)} 处）</h1>{rows}",
+            "utf-8",
+        )
+        console.print(f"逐条核对：{page}")
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{label}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=1), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+
+
 if __name__ == "__main__":
     app()

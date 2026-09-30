@@ -1,4 +1,5 @@
 import hashlib
+import uuid
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -22,6 +23,10 @@ class IssueType(StrEnum):
 
     CHARACTER_AGE = "character.age"
     TIMELINE_DURATION = "timeline.duration"
+    # Step 5-1: character facts.
+    FACT_APPEARANCE = "fact.appearance"
+    CHARACTER_KINSHIP = "character.kinship"
+    TIMELINE_REVIVAL = "timeline.revival"  # appears in person after dying
 
 
 class Evidence(BaseModel):
@@ -29,6 +34,9 @@ class Evidence(BaseModel):
     quote: str
     char_start: int
     char_end: int
+    # Which chapter, whatever its number becomes (step 4.6: an issue whose chapter could
+    # not be extracted is kept, not closed). None in issues stored before.
+    chapter_id: uuid.UUID | None = None
 
 
 class ConsistencyIssue(BaseModel):

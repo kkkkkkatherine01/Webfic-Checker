@@ -29,7 +29,10 @@ class EventKind(StrEnum):
     CREATE = "create"  # {character_id, name}
     ALIAS = "alias"  # {alias_id, character_id, alias}
     RENAME = "rename"  # {character_id, old_name, new_name}
-    MERGE = "merge"  # {from_id, from_name, into_id, fact_ids, alias_ids}
+    MERGE = "merge"  # {from_id, from_name, from_kind, into_id, fact_ids, alias_ids}
+    # An earlier kind of extraction used a character or alias a later kind had named
+    # (step 5-1c): it is credited to the earlier kind from then on.
+    PROMOTE = "promote"  # {character_id, old_kind} or {alias_id, old_kind}
 
 
 async def record(
@@ -94,6 +97,24 @@ async def _undo(
         return [uuid.UUID(i) for i in payload.get(key, [])]
 
     match kind:
+        case EventKind.PROMOTE if "character_id" in payload:
+            await session.execute(
+                update(Character)
+                .where(
+                    Character.id == uuid.UUID(payload["character_id"]),
+                    Character.user_id == user_id,
+                )
+                .values(kind=payload["old_kind"])
+            )
+        case EventKind.PROMOTE:
+            await session.execute(
+                update(CharacterAlias)
+                .where(
+                    CharacterAlias.id == uuid.UUID(payload["alias_id"]),
+                    CharacterAlias.user_id == user_id,
+                )
+                .values(kind=payload["old_kind"])
+            )
         case EventKind.CREATE:
             character_id = uuid.UUID(payload["character_id"])
             for model in (FactRow, CharacterAlias, CharacterStateRow):
@@ -130,7 +151,7 @@ async def _undo(
             session.add(
                 Character(
                     id=from_id, user_id=user_id, book_id=book_id,
-                    canonical_name=payload["from_name"],
+                    canonical_name=payload["from_name"], kind=payload.get("from_kind", "age"),
                 )
             )  # fmt: skip
             await session.flush()

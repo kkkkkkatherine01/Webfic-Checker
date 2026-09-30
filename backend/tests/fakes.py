@@ -23,12 +23,20 @@ def is_note_scan(messages) -> bool:
 
 
 NOTE_PROMPT_START = "你负责区分网络小说章节里的"
+FACTS_PROMPT_START = "你是网络小说的信息抽取助手。任务：从给定的小说正文片段中，抽取关于角色的"
+
+
+def is_facts_extraction(messages) -> bool:
+    """A character-facts extraction (step 5-1), sent after each chapter's age extraction."""
+    return messages[0].content.startswith(FACTS_PROMPT_START)
 
 
 class FakeBackend:
     """Answers with `respond(messages)`; counts real (non-cached) calls. Author's-note
     scans are answered "all story" unless `notes` is given, and kept apart in
-    `note_calls`, so tests about extraction count extraction calls only."""
+    `note_calls`; character-facts extractions are answered "nothing" unless `facts` is
+    given, and kept apart in `facts_calls`. So tests about age extraction count age
+    extraction calls only."""
 
     provider = "fake"
 
@@ -36,11 +44,14 @@ class FakeBackend:
         self,
         respond: Callable[[list[ChatMessage]], str | dict[str, Any]],
         notes: Callable[[list[ChatMessage]], str | dict[str, Any]] | None = None,
+        facts: Callable[[list[ChatMessage]], str | dict[str, Any]] | None = None,
     ):
         self._respond = respond
         self._notes = notes
+        self._facts = facts
         self.calls: list[list[ChatMessage]] = []
         self.note_calls: list[list[ChatMessage]] = []
+        self.facts_calls: list[list[ChatMessage]] = []
 
     async def chat(
         self, *, model, messages, json_mode, extra=None, temperature=None, tools=None
@@ -50,6 +61,11 @@ class FakeBackend:
             answer = self._notes(messages) if self._notes else {"paragraphs": []}
             text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
             return RawCompletion(text=text, usage=Usage(300, 0, 20), model=model)
+        if is_facts_extraction(messages):
+            self.facts_calls.append(list(messages))
+            answer = self._facts(messages) if self._facts else {}
+            text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+            return RawCompletion(text=text, usage=Usage(800, 0, 50), model=model)
         self.calls.append(list(messages))
         answer = self._respond(messages)
         text = answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)

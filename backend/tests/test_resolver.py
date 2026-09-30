@@ -148,3 +148,36 @@ def test_descriptive_phrase_does_not_create_a_character():
     idx = index()
     assert idx.resolve("我六岁的表弟", None) is None
     assert idx.new_characters == []
+
+
+# --- step 5-1e ------------------------------------------------------------------------------
+
+
+def test_counted_kin_and_described_people_are_not_names():
+    for mention in ["一个女生", "四个儿子", "两名死者", "三人", "其中一个", "另一个公子", "有个人",
+                    "为首一人", "他父亲", "我娘", "你的舅舅", "二叔", "中年人", "老妇人",
+                    "黑脸大汉", "朋友", "管家", "皇帝", "四代目夫妇"]:  # fmt: skip
+        assert is_generic_mention(mention), mention
+    for name in ["九头蛟龙", "三头犬", "十方魔尊", "三皇子", "长眉真人", "二花", "九儿",
+                 "小三儿", "老孙", "鸾丫头", "陆长老", "王老汉子"]:  # fmt: skip
+        assert not is_generic_mention(name), name
+
+
+def test_an_alias_is_kept_only_with_evidence():
+    from webfic.extraction.resolver import shares_name
+
+    assert shares_name("水门", "波风水门") and shares_name("陆长老", "陆辰照")
+    assert shares_name("天河真人", "天河子") and shares_name("景儿", "罗景")
+    assert not shares_name("雪娘", "雄雕") and not shares_name("赛太岁", "金毛犼")
+    # Two full names sharing only the surname are two people, often of one family.
+    assert not shares_name("许思安", "许采文") and not shares_name("张老四", "张琼")
+    assert shares_name("赵总旗", "赵义安") and shares_name("老阮", "阮伯通")
+    idx = CharacterIndex([KnownCharacter(LIN, "林远")])
+    # The model's reading is used for this statement...
+    assert idx.resolve("雪娘", "林远", "雪娘从天而降") == LIN
+    # ...but a name with nothing in common is not kept for later chapters,
+    assert idx.new_aliases == [] and idx.resolve("雪娘", None) != LIN
+    idx = CharacterIndex([KnownCharacter(LIN, "林远")])
+    assert idx.resolve("远哥", "林远") == LIN  # one that shares the name is,
+    assert idx.resolve("衡王", "林远", "衡王林远站在宫殿门前") == LIN  # as is one written beside it
+    assert [a.alias for a in idx.new_aliases] == ["远哥", "衡王"]

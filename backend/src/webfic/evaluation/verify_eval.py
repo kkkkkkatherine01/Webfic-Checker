@@ -45,10 +45,11 @@ from webfic.db.models import (
 )
 from webfic.db.session import rolled_back
 from webfic.evaluation import inject as ij
+from webfic.evaluation import inject_facts as fx
 from webfic.evaluation.golden import load_story
 from webfic.evaluation.metrics import Ratio
 from webfic.evaluation.retrieval import RETRIEVAL_USER
-from webfic.facts.registry import AGE
+from webfic.facts.registry import AGE, own_look
 from webfic.llm.base import LLMClient
 from webfic.services import chapters, checks, verification
 
@@ -57,6 +58,20 @@ SetName = Literal["keep", "synthetic", "real"]
 
 SEED = 20260927
 CORRUPTIONS = ("flashback", "speculative", "value", "time_span", "misattributed")
+# Character facts (step 5-1c), after the age types so their seeded choice is unchanged.
+FACT_CORRUPTIONS = ("fact_value", "fact_speculative", "fact_misattributed", "fact_relation")
+CORRUPTIONS = (*CORRUPTIONS, *FACT_CORRUPTIONS)
+FACT_INJECTIONS_PER_KIND = 40
+# The test stories written by the user (step 2's story05, step 5-1's story07): holdouts,
+# kept out of the development set.
+HOLDOUT_STORIES = {"story05", "story07"}
+# The verdict reason a dismissal of each type should give (None: any reason will do).
+EXPECTED_REASON = {
+    "fact_value": None,
+    "fact_speculative": "speculative",
+    "fact_misattributed": "misattributed",
+    "fact_relation": None,
+}
 LABELS_FILE = Path("external") / "inject" / "labels.yaml"  # under eval/
 
 
@@ -114,6 +129,25 @@ async def _books(session: AsyncSession, user_id: uuid.UUID, suffix: str) -> dict
     return {t.split("#")[0]: i for t, i in rows if t.endswith(suffix)}
 
 
+async def prepare_golden(
+    factory: Factory,
+    archival: Archival,
+    golden_dir: Path,
+    extract: Callable[[Any], tuple[LLMClient, Settings]],
+    on_progress: Callable[[str], None] = print,
+) -> None:
+    """The development test stories as extracted, indexed books (the retrieval
+    evaluation's, 500/100): stories added since (step 5-1's story08, 09) are imported,
+    and kinds of extraction added since are read into the existing ones."""
+    from webfic.evaluation.golden import discover
+    from webfic.evaluation.retrieval import CorpusText
+    from webfic.evaluation.retrieval import prepare as prepare_books
+
+    stories = [load_story(d) for d in discover(golden_dir) if d.name not in HOLDOUT_STORIES]
+    corpus = [CorpusText(f"golden/{s.id}", s.text) for s in stories]
+    await prepare_books(factory, archival, corpus, on_progress, extract=extract)
+
+
 async def golden_cases(factory: Factory, golden_dir: Path) -> list[Case]:
     """Every issue the checker reports on the dev test stories (retrieval-eval books,
     which are extracted and indexed), judged by the stories' labels: one that matches an
@@ -142,9 +176,11 @@ async def golden_cases(factory: Factory, golden_dir: Path) -> list[Case]:
         for i in issues:
             ends = (i.evidence[0]["chapter_number"], i.evidence[-1]["chapter_number"])
             ends = (min(ends), max(ends))
-            if any(_matches(s, golden.characters, subjects[i.id], ends) for s in golden.issues):
+
+            label = (golden.characters, subjects[i.id], ends, i.issue_type)
+            if any(_matches(s, *label) for s in golden.issues):
                 set_, kind, expect = "keep", "golden", ["contradiction", "needs_author"]
-            elif any(_matches(s, golden.characters, subjects[i.id], ends) for s in golden.allowed):
+            elif any(_matches(s, *label) for s in golden.allowed):
                 set_, kind = "keep", "golden:allowed"
                 expect = ["contradiction", "needs_author", "false_alarm"]
             else:
@@ -166,11 +202,18 @@ async def golden_cases(factory: Factory, golden_dir: Path) -> list[Case]:
 
 
 def _matches(
-    spec: Any, characters: dict[str, list[str]], subject_names: set[str], ends: tuple[int, int]
+    spec: Any,
+    characters: dict[str, list[str]],
+    subject_names: set[str],
+    ends: tuple[int, int],
+    issue_type: str,
 ) -> bool:
-    """Whether a reported issue (its subject's names, its two ends) is the labelled one."""
+    """Whether a reported issue (its type, its subjects' names, its two ends) is the
+    labelled one."""
     names = {spec.character, *characters.get(spec.character, [])}
-    return bool(names & subject_names) and ends in spec.endpoint_options()
+    return (
+        spec.type == issue_type and bool(names & subject_names) and ends in spec.endpoint_options()
+    )
 
 
 async def _names(session: AsyncSession, ids: list[uuid.UUID]) -> set[str]:
@@ -191,8 +234,12 @@ async def injected_cases(
     """Contradictions injected into the text (3.5-2's detection kinds), spread over kinds."""
     async with factory() as session:
         views = [await ij.load_view(session, n, b) for n, b in sorted(books.items())]
-    per_kind = {k: -(-count // len(ij.DETECT)) for k in ij.DETECT}
-    injections = ij.plan(views, per_kind, seed)[:count]
+    # The age kinds keep their share of before step 5-1c (and come first), so the age
+    # cases stay what they were; the character-fact kinds follow with their own.
+    age_kinds = [k for k in ij.DETECT if k not in fx.DETECT]
+    per_kind = {k: -(-count // len(age_kinds)) for k in age_kinds}
+    per_kind |= {k: FACT_INJECTIONS_PER_KIND for k in fx.DETECT}
+    injections = ij.plan(views, per_kind, seed)
     return [
         Case(
             id=inj.id,
@@ -249,7 +296,7 @@ async def synthetic_cases(
                     user_id=user_id,
                     book_id=books[name],
                     expect=["false_alarm"],
-                    reason=kind,
+                    reason=EXPECTED_REASON.get(kind, kind),
                     fingerprint=fingerprint,
                     corruption=corruption,
                 )
@@ -319,6 +366,74 @@ async def _corruptions(
     for s in spans:
         found.append(Corruption(type="time_span", table="span", row_id=s.id,
                                 changes={"kind": "advance"}, **at(s)))  # fmt: skip
+    found += await _fact_corruptions(factory, user_id, book_id)
+    return found
+
+
+async def _fact_corruptions(
+    factory: Factory, user_id: uuid.UUID, book_id: uuid.UUID
+) -> list[Corruption]:
+    """Character facts changed against the text (step 5-1c): a colour, a rumoured death
+    made certain, a death given to someone who appears later, a relation made one that
+    cannot hold beside the others. Only changes that give the checker something to
+    compare are listed; `_produce` keeps those that make it report."""
+    from webfic.evaluation.inject_facts import CONFLICTING, OTHER_COLOR
+
+    async with factory() as session:
+        facts = (
+            await session.scalars(
+                select(FactRow).where(
+                    FactRow.user_id == user_id,
+                    FactRow.book_id == book_id,
+                    FactRow.category.in_(["appearance", "kinship", "life"]),
+                )
+            )
+        ).all()
+
+    def at(row: Any) -> dict[str, int]:
+        return {"chapter": row.chapter_number, "start": row.char_start, "end": row.char_end}
+
+    def comparable(f: FactRow) -> bool:
+        return not (f.is_flashback or f.is_speculative) and own_look(f.qualifiers)
+
+    found: list[Corruption] = []
+    looks = Counter(
+        (f.character_id, f.attribute) for f in facts if f.category == "appearance" and comparable(f)
+    )
+    pairs = Counter(
+        (f.character_id, (f.qualifiers or {}).get("other_name"))
+        for f in facts
+        if f.category == "kinship" and not f.is_speculative
+    )
+    presence = [f for f in facts if f.category == "life" and f.attribute == "present"]
+    for f in sorted(facts, key=lambda f: (f.chapter_number, f.char_start)):
+        if (
+            f.category == "appearance"
+            and comparable(f)
+            and f.value_text in OTHER_COLOR
+            and looks[(f.character_id, f.attribute)] >= 2
+        ):
+            found.append(Corruption(type="fact_value", table="fact", row_id=f.id,
+                                    changes={"value_text": OTHER_COLOR[f.value_text]},
+                                    **at(f)))  # fmt: skip
+        elif f.category == "life" and f.attribute == "died":
+            later = [p for p in presence if p.chapter_number > f.chapter_number]
+            if f.is_speculative and any(p.character_id == f.character_id for p in later):
+                found.append(Corruption(type="fact_speculative", table="fact", row_id=f.id,
+                                        changes={"is_speculative": False}, **at(f)))  # fmt: skip
+            others = sorted({str(p.character_id) for p in later} - {str(f.character_id)})
+            if not f.is_speculative and others:
+                found.append(Corruption(type="fact_misattributed", table="fact", row_id=f.id,
+                                        changes={"character_id": others[0]}, **at(f)))  # fmt: skip
+        elif (
+            f.category == "kinship"
+            and not f.is_speculative
+            and f.attribute in CONFLICTING
+            and pairs[(f.character_id, (f.qualifiers or {}).get("other_name"))] >= 2
+        ):
+            found.append(Corruption(type="fact_relation", table="fact", row_id=f.id,
+                                    changes={"attribute": CONFLICTING[f.attribute][0]},
+                                    **at(f)))  # fmt: skip
     return found
 
 

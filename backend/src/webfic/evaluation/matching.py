@@ -3,8 +3,9 @@ Pure functions, no I/O."""
 
 from dataclasses import dataclass, field
 
-from webfic.checkers.types import Confidence
+from webfic.checkers.types import Confidence, IssueType
 from webfic.evaluation.golden import AllowedIssue, ExpectedIssue, Story
+from webfic.facts import kinship
 
 VALUE_TOLERANCE = 0.01
 
@@ -49,6 +50,25 @@ class ModelIssue:
     chapters: set[int]
     confidence: Confidence
     description: str
+    issue_type: str = IssueType.CHARACTER_AGE.value
+
+
+@dataclass
+class ModelCharFact:
+    """A character fact (step 5-1): appearance, kinship or life."""
+
+    character_id: str
+    category: str
+    attribute: str
+    chapter: int
+    start: int
+    end: int
+    value: str | None = None
+    flashback: bool = False
+    speculative: bool = False
+    disguised: bool = False
+    temporary: bool = False  # a passing state (5-1d)
+    other_name: str | None = None  # kinship: the other side
 
 
 @dataclass
@@ -58,6 +78,7 @@ class Observation:
     elapsed: list[ModelElapsed]
     issues: list[ModelIssue]
     dropped: int = 0
+    char_facts: list[ModelCharFact] = field(default_factory=list)
 
 
 # --- scores ----------------------------------------------------------------------------
@@ -91,13 +112,38 @@ class FactScore:
     merges: list[str] = field(default_factory=list)  # one model character = several real ones
     splits: list[str] = field(default_factory=list)  # one real character = several model ones
     dropped: int = 0
+    # Character facts (step 5-1): found = at the quote for the right character(s),
+    # correct = every labelled attribute right as well.
+    traits_expected: int = 0
+    traits_found: int = 0
+    traits_correct: int = 0
+    kinship_expected: int = 0
+    kinship_found: int = 0
+    kinship_correct: int = 0
+    deaths_expected: int = 0
+    deaths_found: int = 0
+    deaths_correct: int = 0
+    char_traps: int = 0
+    char_traps_passed: int = 0
+    char_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
 class StoryScore:
     story: str
-    issues: IssueScore
+    issues: IssueScore  # age issues (comparable with the runs before step 5-1)
     facts: FactScore
+    # Issues of the character-fact checker (step 5-1).
+    char_issues: IssueScore = field(default_factory=IssueScore)
+
+
+# Issue types scored together, by checker.
+AGE_TYPES = {IssueType.CHARACTER_AGE.value, IssueType.TIMELINE_DURATION.value}
+CHAR_FACT_TYPES = {
+    IssueType.FACT_APPEARANCE.value,
+    IssueType.CHARACTER_KINSHIP.value,
+    IssueType.TIMELINE_REVIVAL.value,
+}
 
 
 # --- characters ------------------------------------------------------------------------
@@ -138,6 +184,8 @@ def _covers(
 ) -> bool:
     """Same character, and the report's two ends are in exactly the expected chapters.
     Evidence in between (elapsed-time quotes) does not matter."""
+    if issue.issue_type != spec.type:
+        return False
     standard_names = set().union(*(mapping.get(s, set()) for s in issue.subjects))
     if spec.character not in standard_names or not issue.chapters:
         return False
@@ -145,12 +193,23 @@ def _covers(
 
 
 def match_issues(
-    story: Story, issues: list[ModelIssue], mapping: dict[str, set[str]]
+    story: Story,
+    issues: list[ModelIssue],
+    mapping: dict[str, set[str]],
+    types: set[str] | None = None,
 ) -> IssueScore:
-    score = IssueScore(expected=len(story.golden.issues))
+    """With `types`, only issues and expectations of those types are scored."""
+    specs = [i for i in story.golden.issues if types is None or i.type in types]
+    allowed = [
+        a
+        for a in [*story.golden.allowed, *story.golden.dismiss]
+        if types is None or a.type in types
+    ]
+    issues = [i for i in issues if types is None or i.issue_type in types]
+    score = IssueScore(expected=len(specs))
     unmatched = list(issues)
 
-    for spec in story.golden.issues:
+    for spec in specs:
         candidates = [i for i in unmatched if _covers(i, spec, mapping)]
         if not candidates:
             score.missed.append(spec.id)
@@ -165,7 +224,7 @@ def match_issues(
             )
 
     for issue in unmatched:
-        if any(_covers(issue, a, mapping) for a in story.golden.allowed):
+        if any(_covers(issue, a, mapping) for a in allowed):
             score.allowed += 1
         elif issue.confidence == Confidence.INSUFFICIENT_INFO:
             score.insufficient += 1
@@ -294,10 +353,121 @@ def match_facts(story: Story, obs: Observation, mapping: dict[str, set[str]]) ->
     return score
 
 
+def match_char_facts(
+    story: Story, obs: Observation, mapping: dict[str, set[str]], score: FactScore
+) -> None:
+    """Character facts (step 5-1) into `score`."""
+    facts, golden = story.golden.facts, story.golden
+
+    def who(character_id: str) -> set[str]:
+        return mapping.get(character_id, set())
+
+    def named(name: str | None) -> set[str]:
+        return {std for std in golden.characters if name and name in golden.all_names(std)}
+
+    def at(category: str, place) -> list[ModelCharFact]:
+        span = story.span(place.chapter, place.quote)
+        return [
+            f
+            for f in obs.char_facts
+            if f.category == category and span.overlaps(f.chapter, f.start, f.end)
+        ]
+
+    score.traits_expected = len(facts.traits)
+    for exp in facts.traits:
+        hits = [
+            f
+            for f in at("appearance", exp)
+            if f.attribute == exp.attribute and exp.character in who(f.character_id)
+        ]
+        if not hits:
+            score.char_errors.append(f"第 {exp.chapter} 章外貌未抽到：{exp.quote}")
+            continue
+        score.traits_found += 1
+        hit = hits[0]
+        # A mark is compared by where it is ("左脸·十字刀疤" and "左脸·刀疤" are one scar),
+        # as the checker does.
+        if exp.attribute == "mark":
+            same = (hit.value or "").split("·")[0] == exp.value.split("·")[0]
+        else:
+            same = hit.value == exp.value
+        checks = [
+            (f"值 {hit.value}≠{exp.value}", same),
+            ("回忆标记", hit.flashback == exp.flashback),
+            ("推测标记", hit.speculative == exp.speculative),
+            ("伪装标记", hit.disguised == exp.disguised),
+        ]
+        wrong = [label for label, ok in checks if not ok]
+        if wrong:
+            what = "、".join(wrong)
+            score.char_errors.append(f"第 {exp.chapter} 章「{exp.quote}」外貌：{what}")
+        else:
+            score.traits_correct += 1
+
+    score.kinship_expected = len(facts.kinship)
+    for exp in facts.kinship:
+        expected = kinship.kin(exp.relation)
+        found, correct = False, False
+        for f in at("kinship", exp):
+            a, b = who(f.character_id), named(f.other_name)
+            if exp.character in a and exp.other in b:
+                stated = kinship.kin(f.attribute)
+            elif exp.other in a and exp.character in b:
+                stated = kinship.kin(f.attribute).inverse()
+            else:
+                continue
+            found = True
+            correct = correct or kinship.conflict(stated, expected) is None
+        if not found:
+            score.char_errors.append(f"第 {exp.chapter} 章亲属未抽到：{exp.quote}")
+            continue
+        score.kinship_found += 1
+        if correct:
+            score.kinship_correct += 1
+        else:
+            score.char_errors.append(f"第 {exp.chapter} 章「{exp.quote}」亲属关系错误")
+
+    score.deaths_expected = len(facts.deaths)
+    for exp in facts.deaths:
+        hits = [
+            f
+            for f in at("life", exp)
+            if f.attribute == "died" and exp.character in who(f.character_id)
+        ]
+        if not hits:
+            score.char_errors.append(f"第 {exp.chapter} 章死亡未抽到：{exp.quote}")
+            continue
+        score.deaths_found += 1
+        if hits[0].speculative == exp.speculative:
+            score.deaths_correct += 1
+        else:
+            score.char_errors.append(f"第 {exp.chapter} 章「{exp.quote}」死亡：推测标记错误")
+
+    def comparable(f: ModelCharFact) -> bool:
+        return not (f.flashback or f.speculative or f.disguised or f.temporary)
+
+    traps = [
+        ("外貌", facts.not_traits, "appearance", comparable),
+        ("亲属", facts.not_kinship, "kinship", lambda f: not f.speculative),
+        ("死亡", facts.not_deaths, "life", lambda f: f.attribute == "died" and not f.speculative),
+        ("出场", facts.not_presence, "life", lambda f: f.attribute == "present"),
+    ]
+    for label, kind_traps, category, counts in traps:
+        for trap in kind_traps:
+            score.char_traps += 1
+            if any(counts(f) for f in at(category, trap)):
+                score.char_errors.append(f"第 {trap.chapter} 章误抽为{label}：{trap.quote}")
+            else:
+                score.char_traps_passed += 1
+
+
 def score_story(story: Story, obs: Observation) -> StoryScore:
     mapping = map_characters(story, obs.characters)
+    facts = match_facts(story, obs, mapping)
+    match_char_facts(story, obs, mapping, facts)
     return StoryScore(
         story=story.id,
-        issues=match_issues(story, obs.issues, mapping),
-        facts=match_facts(story, obs, mapping),
+        issues=match_issues(story, obs.issues, mapping, AGE_TYPES),
+        facts=facts,
+        char_issues=match_issues(story, obs.issues, mapping, CHAR_FACT_TYPES),
     )

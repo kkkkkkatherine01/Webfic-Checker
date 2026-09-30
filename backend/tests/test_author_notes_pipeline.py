@@ -99,3 +99,26 @@ def test_the_note_prompt_shares_no_text_with_the_evaluation_data():
     data = path.read_text("utf-8")
     leaks = [f for f in set(re.findall(r"[一-鿿]{6,}", load_prompt())) if f in data]
     assert leaks == []
+
+
+async def test_a_longer_head_note_moves_reused_facts_with_the_story(world):
+    # Step 4.6: the story text is unchanged, so the stored extraction is reused, but the
+    # note before it grew; stored positions must follow the story.
+    async with world.factory() as session:
+        from webfic.db.models import Chapter
+
+        content = await session.scalar(select(Chapter.content).where(Chapter.number == 1))
+    longer = content.replace("今天只有一更。", "今天只有一更，感谢各位读者的打赏和月票支持！")
+    calls = len(world.backend.calls)
+    result = await world.do(chapters.replace_chapter, number=1, content=longer)
+    assert result.reused >= 1 and len(world.backend.calls) == calls  # no model call
+    async with world.factory() as session:
+        from webfic.db.models import Chapter
+
+        rows = await session.execute(
+            select(Chapter.content, FactRow.char_start, FactRow.char_end, FactRow.raw_text).join(
+                FactRow, FactRow.chapter_id == Chapter.id
+            )
+        )
+        for text, start, end, raw in rows:
+            assert text[start:end] == raw

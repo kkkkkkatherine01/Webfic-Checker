@@ -48,6 +48,7 @@ class ChangeResult(BaseModel):
     extracted: int  # chapters (re-)extracted
     failed: int
     llm_calls: int
+    calls_by_kind: dict[str, int] = {}  # extraction calls per kind (step 5-0)
     cache_hits: int
     reused: int  # unchanged chapters whose stored extraction was reused
     cost_usd: Decimal
@@ -134,7 +135,9 @@ async def _apply(
                 f"第 {listed} 章之前抽取失败，没有参与这次重算；可以用 resume 补跑。",
             ]
         async with scoped() as session:
-            await checks.run_checks(session, user_id=user_id, book_id=book_id)
+            checked = await checks.run_checks(session, user_id=user_id, book_id=book_id)
+            if checked.kept_unextracted:
+                warnings = [*warnings, kept_warning(checked)]
             after = await _open_issues(session, user_id, book_id)
             chapters = await session.scalar(
                 select(func.count()).where(Chapter.user_id == user_id, Chapter.book_id == book_id)
@@ -145,6 +148,7 @@ async def _apply(
             extracted=extraction.extracted,
             failed=extraction.failed,
             llm_calls=extraction.llm_calls,
+            calls_by_kind=extraction.calls_by_kind,
             cache_hits=extraction.cache_hits,
             reused=extraction.reused,
             cost_usd=extraction.cost_usd,
@@ -157,6 +161,14 @@ async def _apply(
         return await run(factory)
     async with rolled_back(factory) as scoped:
         return await run(scoped)
+
+
+def kept_warning(checked: checks.CheckResult) -> str:
+    listed = "、".join(str(n) for n in checked.unextracted)
+    return (
+        f"第 {listed} 章没有抽取成功，涉及这些章节的 {checked.kept_unextracted} 个问题保持原状态；"
+        "用 resume 补跑后会重新检查。"
+    )
 
 
 # --- operations ------------------------------------------------------------------------
@@ -365,13 +377,16 @@ async def rescan_author_notes(
                 with_notes.append(chapter.number)
             start, end = scan.story(chapter.content)
             story_hash = hashlib.sha256(chapter.content[start:end].encode()).hexdigest()
-            stored = await session.scalar(
-                select(ChapterExtractionRow.content_hash).where(
-                    ChapterExtractionRow.user_id == user_id,
-                    ChapterExtractionRow.chapter_id == chapter.id,
+            # Every kind of extraction read the same story text (step 5-0: one row each).
+            stored = set(
+                await session.scalars(
+                    select(ChapterExtractionRow.content_hash).where(
+                        ChapterExtractionRow.user_id == user_id,
+                        ChapterExtractionRow.chapter_id == chapter.id,
+                    )
                 )
             )
-            if first is None and chapter.status == "extracted" and stored != story_hash:
+            if first is None and chapter.status == "extracted" and stored != {story_hash}:
                 first = chapter.number
         listed = "、".join(str(n) for n in with_notes) or "无"
         warnings = [f"识别到作者的话的章节：{listed}"]

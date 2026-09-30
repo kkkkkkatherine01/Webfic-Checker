@@ -28,7 +28,7 @@ from webfic.db.models import (
     FactRow,
 )
 from webfic.extraction.schemas import LifeStage
-from webfic.facts.registry import AGE
+from webfic.facts.registry import AGE, APPEARANCE, LIFE, own_look
 from webfic.memory.recall import find_character
 from webfic.services.errors import NotFound
 
@@ -48,6 +48,20 @@ class CharacterState(BaseModel):
     age_story_time: float | None = None  # story time within `age_epoch`
     life_stage: LifeStage | None = None
     life_stage_chapter: int | None = None
+    # Step 5-1: the latest stated features of appearance (not guessed, not disguised),
+    # and death (not rumoured).
+    traits: dict[str, "Stated"] = {}  # eye_color / hair_color / mark -> latest
+    died_chapter: int | None = None
+    died_quote: str | None = None
+
+
+class Stated(BaseModel):
+    value: str
+    chapter: int
+    quote: str
+
+
+CharacterState.model_rebuild()
 
 
 class BookState(BaseModel):
@@ -68,6 +82,7 @@ class CoreFact(Protocol):
     is_speculative: bool
     raw_text: str
     char_start: int
+    qualifiers: dict
 
 
 class CoreSpan(Protocol):
@@ -124,6 +139,10 @@ def advance(
             for field in ("age_low", "age_high", "age_chapter", "age_quote", "age_epoch",
                           "age_story_time", "life_stage", "life_stage_chapter"):  # fmt: skip
                 setattr(target, field, getattr(source, field))
+        if source is not None and target is not None:
+            target.traits = {**source.traits, **target.traits}
+            if target.died_chapter is None:
+                target.died_chapter, target.died_quote = source.died_chapter, source.died_quote
 
     current: dict[uuid.UUID, CharacterState] = {}
     for c in characters:
@@ -135,7 +154,19 @@ def advance(
     clock = _clock(previous, spans)
     for fact in sorted(facts, key=lambda f: f.char_start):
         state = current.get(fact.character_id)
-        if state is None or fact.category != AGE.name or fact.is_flashback or fact.is_speculative:
+        if state is None or fact.is_flashback or fact.is_speculative:
+            continue
+        if fact.category == APPEARANCE.name and fact.value_text:
+            if own_look(fact.qualifiers):
+                state.traits[fact.attribute] = Stated(
+                    value=fact.value_text, chapter=chapter_number, quote=fact.raw_text
+                )
+            continue
+        if fact.category == LIFE.name and fact.attribute == "died":
+            if state.died_chapter is None:
+                state.died_chapter, state.died_quote = chapter_number, fact.raw_text
+            continue
+        if fact.category != AGE.name:
             continue
         if fact.attribute == "absolute_age" and fact.value_num is not None:
             state.age_low = fact.value_num
@@ -343,6 +374,9 @@ class CharacterView(BaseModel):
     estimated_age_high: float | None
     life_stage: LifeStage | None
     life_stage_chapter: int | None
+    traits: dict[str, Stated] = {}  # latest stated feature of appearance (step 5-1)
+    died_chapter: int | None = None
+    died_quote: str | None = None
 
 
 async def get_character(
@@ -383,4 +417,7 @@ async def get_character(
         estimated_age_high=estimate[1] if estimate else None,
         life_stage=state.life_stage,
         life_stage_chapter=state.life_stage_chapter,
+        traits=state.traits,
+        died_chapter=state.died_chapter,
+        died_quote=state.died_quote,
     )

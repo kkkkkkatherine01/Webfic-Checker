@@ -15,12 +15,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from webfic.agent.tools import RunState, Tool, ToolArgs, ToolContext, ToolRegistry
-from webfic.db.models import Chapter, ChapterNoteRow, FactRow
+from webfic.checkers.age import CHECKER_NAME as AGE_CHECKER
+from webfic.checkers.character_facts import CHECKER_NAME as CHARACTER_FACTS_CHECKER
+from webfic.db.models import Chapter, ChapterNoteRow
 from webfic.extraction.locator import locate
+from webfic.facts.describe import describe_span, fmt_range
+from webfic.facts.registry import AGE, APPEARANCE, KINSHIP, LIFE, describe_fact
 from webfic.memory import archival as archival_memory
 from webfic.memory import core, recall
 
 PROMPT_VERSION = "verify_v2"
+# The prompt that verifies each checker's issues (step 5-0). Ages keep verify_v2 word for
+# word; a new checker brings its own prompt and reasons (docs/steps/05-more-checkers.md).
+PROMPTS = {AGE_CHECKER: PROMPT_VERSION, CHARACTER_FACTS_CHECKER: "verify_facts_v1"}
 
 Verdict = Literal["contradiction", "false_alarm", "needs_author"]
 Reason = Literal[
@@ -62,6 +69,13 @@ MAX_READ = 3000
 MAX_SPAN = 2000
 MAX_SEARCH = 5  # passages per search (500 characters each)
 MAX_ITEMS = 40
+
+
+def prompt_for(checker: str) -> str:
+    """The prompt version for a checker's issues."""
+    if checker not in PROMPTS:
+        raise ValueError(f"no verify prompt for checker {checker}")
+    return PROMPTS[checker]
 
 
 def load_prompt(name: str = PROMPT_VERSION) -> str:
@@ -169,11 +183,11 @@ async def get_character(ctx: ToolContext, args: CharacterArgs) -> CharacterBrief
         )  # fmt: skip
     stated = None
     if v.age_low is not None:
-        stated = f"{_range(v.age_low, v.age_high)} 岁（第 {v.age_chapter} 章「{v.age_quote}」）"
+        stated = f"{fmt_range(v.age_low, v.age_high)} 岁（第 {v.age_chapter} 章「{v.age_quote}」）"
     estimated = None
     if v.estimated_age_low is not None:
         estimated = (
-            f"{_range(v.estimated_age_low, v.estimated_age_high)} 岁（按时间段推算，仅供参考）"
+            f"{fmt_range(v.estimated_age_low, v.estimated_age_high)} 岁（按时间段推算，仅供参考）"
         )
     stage = f"{v.life_stage}（第 {v.life_stage_chapter} 章）" if v.life_stage else None
     return CharacterBrief(
@@ -199,9 +213,11 @@ class FactBrief(BaseModel):
 
 async def list_facts(ctx: ToolContext, args: FactsArgs) -> list[FactBrief] | str:
     async with ctx.factory() as session:
+        # Ages only: the age prompt's tool, whose results must not change as other
+        # kinds of facts are added (step 5-1).
         facts = await recall.list_facts(
             session, user_id=ctx.user_id, book_id=ctx.book_id, character=args.character,
-            chapters=_chapters(args.first_chapter, args.last_chapter),
+            category=AGE.name, chapters=_chapters(args.first_chapter, args.last_chapter),
         )  # fmt: skip
     briefs = [
         FactBrief(chapter=f.chapter_number, start=f.char_start, end=f.char_end, text=f.raw_text,
@@ -321,60 +337,126 @@ def verify_tools() -> ToolRegistry:
     )  # fmt: skip
 
 
-# --- describing facts for the model -------------------------------------------------------
+# --- character facts (step 5-1) -------------------------------------------------------------
 
-_ATTRIBUTE = {
-    "absolute_age": "年龄",
-    "relative_age": "相对年龄",
-    "birth_year": "出生年份",
-    "life_stage": "人生阶段",
+FactsReason = Literal[
+    "misattributed",
+    "equivalent",
+    "explained",
+    "flashback",
+    "speculative",
+    "generic",
+    "genuine",
+    "ambiguous",
+    "other",
+]
+FACTS_REASON_LABEL = {
+    "misattributed": "认错人",
+    "equivalent": "说法等价",
+    "explained": "原文交代了变化",
+    "flashback": "回忆 / 梦境",
+    "speculative": "推测 / 传闻",
+    "generic": "不是血缘 / 泛指",
+    "genuine": "确实矛盾",
+    "ambiguous": "原文有歧义",
+    "other": "其他",
 }
-_KIND = {
-    "advance": "推进",
-    "short": "短时推进（不计入年龄推算）",
-    "retrospective": "回顾（不推进）",
-    "future": "将来 / 计划（不推进）",
-}
+REASON_LABEL.update({k: v for k, v in FACTS_REASON_LABEL.items() if k not in REASON_LABEL})
 
 
-def describe_fact(f: recall.FactView | FactRow) -> str:
-    """What extraction made of a statement, in words."""
-    if f.attribute == "life_stage":
-        value = f.value_text or "?"
-    elif f.value_num is None:
-        value = "?"
-    else:
-        value = _range(f.value_num, f.value_max) + (" 岁" if f.attribute == "absolute_age" else "")
-    flags = []
-    if f.is_flashback:
-        ago = (
-            f"，距今 {_num(f.years_before_present)} 年"
-            if f.years_before_present
-            else "，距今年数未知"
-        )
-        flags.append("回忆" + ago)
-    else:
-        flags.append("现在时")
-    if f.is_speculative:
-        flags.append("推测")
-    return f"{_ATTRIBUTE.get(f.attribute, f.attribute)} {value}；{'、'.join(flags)}"
+class FactsVerdictArgs(ToolArgs):
+    verdict: Verdict = Field(
+        description="contradiction：真矛盾；false_alarm：误报；needs_author：原文有歧义，只能由作者判断"
+    )
+    reason: FactsReason = Field(description="判断依据的类型，见说明")
+    explanation: str = Field(description="给作者看的一两句中文说明")
+    evidence: list[Quote] = Field(description="支持结论的原文，至少一条")
 
 
-def describe_span(kind: str, years: float | None, flashback: bool) -> str:
-    amount = f"{_num(years)} 年" if years is not None else "年数不明"
-    return f"{_KIND.get(kind, kind)}，{amount}" + ("；在回忆里" if flashback else "")
+FactCategory = Literal["appearance", "kinship", "life"]
 
 
-def _num(x: float | None) -> str:
-    if x is None:
-        return "?"
-    return str(int(x)) if float(x).is_integer() else f"{x:.3g}"
+class CharacterFactsArgs(ToolArgs):
+    character: str = Field(description="角色名或别名")
+    category: FactCategory | None = Field(
+        default=None, description="appearance：外貌；kinship：亲属；life：死亡与出场；不填为全部"
+    )
+    first_chapter: int | None = Field(default=None)
+    last_chapter: int | None = Field(default=None)
 
 
-def _range(low: float, high: float | None) -> str:
-    if high is None or high == low:
-        return _num(low)
-    return f"{_num(low)}–{_num(high)}"
+async def list_character_facts(ctx: ToolContext, args: CharacterFactsArgs) -> list[FactBrief] | str:
+    categories = [args.category] if args.category else [APPEARANCE.name, KINSHIP.name, LIFE.name]
+    facts = []
+    async with ctx.factory() as session:
+        for category in categories:
+            facts += await recall.list_facts(
+                session, user_id=ctx.user_id, book_id=ctx.book_id, character=args.character,
+                category=category, chapters=_chapters(args.first_chapter, args.last_chapter),
+            )  # fmt: skip
+    facts.sort(key=lambda f: (f.chapter_number, f.char_start))
+    briefs = [
+        FactBrief(chapter=f.chapter_number, start=f.char_start, end=f.char_end, text=f.raw_text,
+                  mention=f.mention, reading=describe_fact(f))
+        for f in facts
+    ]  # fmt: skip
+    return _limited(briefs)
+
+
+class FactsCharacterBrief(BaseModel):
+    name: str
+    aliases: list[str]
+    as_of_chapter: int
+    appearance: list[str]  # the latest stated features, with their source
+    died: str | None
+
+
+_TRAIT_WORD = {"eye_color": "瞳色", "hair_color": "发色", "mark": "身体标记"}
+
+
+async def get_character_facts(ctx: ToolContext, args: CharacterArgs) -> FactsCharacterBrief:
+    async with ctx.factory() as session:
+        v = await core.get_character(
+            session, user_id=ctx.user_id, book_id=ctx.book_id, name=args.name,
+            as_of_chapter=args.as_of_chapter,
+        )  # fmt: skip
+    appearance = [
+        f"{_TRAIT_WORD.get(k, k)} {t.value}（第 {t.chapter} 章「{t.quote}」）"
+        for k, t in sorted(v.traits.items())
+    ]
+    died = f"第 {v.died_chapter} 章「{v.died_quote}」" if v.died_chapter else None
+    return FactsCharacterBrief(
+        name=v.canonical_name, aliases=v.aliases, as_of_chapter=v.as_of_chapter,
+        appearance=appearance, died=died,
+    )  # fmt: skip
+
+
+def facts_tools() -> ToolRegistry:
+    """The tools of the character-facts prompt (`verify_facts_v1`)."""
+    return ToolRegistry(
+        [
+            Tool("read_passage", "读取某章某个位置前后的原文。核实时首先用它读证据的上下文。",
+                 ReadPassageArgs, run=read_passage),
+            Tool("search_text", "在全书原文中检索段落（向量 + 关键词），可限定角色和章节范围。"
+                 "用来找变化的交代（染发、易容、复活、身世揭晓）、角色的其他描写；"
+                 "查询写成具体事实或原文措辞。", SearchTextArgs, run=search_text),
+            Tool("get_character", "查角色的主名、别名、最近写明的外貌及出处、死亡章节。",
+                 CharacterArgs, run=get_character_facts),
+            Tool("list_facts", "列出某角色被抽取出的外貌、亲属、死亡与出场记录"
+                 "（章节、位置、原文、抽取结果），可按类别和章节范围过滤。",
+                 CharacterFactsArgs, run=list_character_facts),
+            Tool("submit_verdict", "提交核实结论。提交后本次核实结束。",
+                 FactsVerdictArgs, terminal=True, guard=check_verdict),
+        ]
+    )  # fmt: skip
+
+
+# The tools that go with each prompt version.
+TOOLS = {"verify_v1": verify_tools, "verify_v2": verify_tools, "verify_facts_v1": facts_tools}
+
+
+def tools_for(prompt: str) -> ToolRegistry:
+    return TOOLS[prompt]()
 
 
 def _chapters(first: int | None, last: int | None) -> tuple[int, int] | None:

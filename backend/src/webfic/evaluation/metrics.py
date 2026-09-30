@@ -61,6 +61,18 @@ class Metrics(BaseModel):
     splits: int = 0
     dropped: int = 0
     fact_errors: dict[str, int] = {}
+    # character facts (step 5-1): the checker's issues, and extraction
+    char_issue_recall: Ratio = Ratio()
+    char_issue_precision: Ratio = Ratio()
+    # Reports the labels allow or expect the verify agent to dismiss (not false alarms).
+    char_allowed: int = 0
+    trait_recall: Ratio = Ratio()
+    trait_accuracy: Ratio = Ratio()
+    kinship_recall: Ratio = Ratio()
+    kinship_accuracy: Ratio = Ratio()
+    death_recall: Ratio = Ratio()
+    death_accuracy: Ratio = Ratio()
+    char_trap_pass: Ratio = Ratio()
     # cost
     cost_usd: Decimal = Decimal(0)
     input_tokens: int = 0
@@ -111,6 +123,23 @@ def aggregate_story(story: str, chars: int, samples: list[SampleResult]) -> Metr
         m.dropped += f.dropped
         errors.update([*f.age_errors, *f.elapsed_errors, *f.trap_errors, *f.merges, *f.splits])
 
+        c = s.score.char_issues
+        found = len(c.matched)
+        m.char_issue_recall += Ratio(num=found, den=c.expected)
+        m.char_issue_precision += Ratio(num=found, den=found + len(c.false_positives))
+        m.char_allowed += c.allowed
+        for issue_id in [*c.matched, *c.missed]:
+            hits[f"{story}/{issue_id}"] += issue_id in c.matched
+        fps.update(c.false_positives)
+        m.trait_recall += Ratio(num=f.traits_found, den=f.traits_expected)
+        m.trait_accuracy += Ratio(num=f.traits_correct, den=f.traits_found)
+        m.kinship_recall += Ratio(num=f.kinship_found, den=f.kinship_expected)
+        m.kinship_accuracy += Ratio(num=f.kinship_correct, den=f.kinship_found)
+        m.death_recall += Ratio(num=f.deaths_found, den=f.deaths_expected)
+        m.death_accuracy += Ratio(num=f.deaths_correct, den=f.deaths_found)
+        m.char_trap_pass += Ratio(num=f.char_traps_passed, den=f.char_traps)
+        errors.update(f.char_errors)
+
         m.cost_usd += s.cost_usd
         m.input_tokens += s.input_tokens
         m.output_tokens += s.output_tokens
@@ -138,6 +167,16 @@ _SUMMED = (
     "merges",
     "splits",
     "dropped",
+    "char_issue_recall",
+    "char_issue_precision",
+    "char_allowed",
+    "trait_recall",
+    "trait_accuracy",
+    "kinship_recall",
+    "kinship_accuracy",
+    "death_recall",
+    "death_accuracy",
+    "char_trap_pass",
     "cost_usd",
     "input_tokens",
     "output_tokens",

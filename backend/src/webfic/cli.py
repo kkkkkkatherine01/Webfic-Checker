@@ -25,7 +25,15 @@ from webfic.llm.base import ProviderError
 from webfic.llm.cache import DbCallStore
 from webfic.llm.factory import LLMNotConfigured, platform_client
 from webfic.memory import archival, core
-from webfic.services import chapters, checks, imports, reports, traces, verification
+from webfic.services import (
+    chapters,
+    checks,
+    imports,
+    pipeline,
+    reports,
+    traces,
+    verification,
+)
 from webfic.services.errors import InvalidEdit, NotFound
 
 app = typer.Typer(help="网文一致性检查工具", no_args_is_help=True, add_completion=False)
@@ -89,7 +97,13 @@ async def _resolve_book(factory: Factory, user_id: uuid.UUID, book: str) -> uuid
     return matches[0]
 
 
-async def _extract(settings: Settings, factory: Factory, book_id: uuid.UUID) -> None:
+_STAGE_LABEL = {"check": "检查中…", "verify": "校验 agent 正在核实…"}
+
+
+async def _process(
+    settings: Settings, factory: Factory, book_id: uuid.UUID, *, check: bool, verify: bool
+) -> None:
+    """Extract, check and verify the book (`services.pipeline`), then print each part."""
     user_id = settings.dev_user_id
     llm = platform_client(settings, DbCallStore(factory, user_id=user_id, book_id=book_id))
 
@@ -104,15 +118,33 @@ async def _extract(settings: Settings, factory: Factory, book_id: uuid.UUID) -> 
             if event.status == "failed":
                 progress.console.print(f"[red]✗ {event.chapter_title} 失败：{event.error}[/]")
 
-        result = await imports.run_import_job(
-            factory, llm, settings, user_id=user_id, book_id=book_id, on_progress=on_progress,
-            archival=platform_archival(settings),
+        def on_stage(stage: pipeline.Stage) -> None:
+            if stage in _STAGE_LABEL:
+                progress.update(task, description=_STAGE_LABEL[stage])
+
+        result = await pipeline.process_book(
+            factory, llm, settings, user_id=user_id, book_id=book_id,
+            archival=platform_archival(settings), check=check, verify=verify,
+            on_progress=on_progress, on_stage=on_stage,
         )  # fmt: skip
 
+    _print_extraction(result.extraction)
+    if result.checks is not None:
+        _print_checks(result.checks)
+    if result.verification is not None:
+        _print_verification(result.verification)
+
+
+def _print_extraction(result: imports.ImportJobResult) -> None:
     if result.recomputed_from is not None:
         console.print(
             f"[yellow]第 {result.recomputed_from} 章之前没有抽取成功，已从这一章起按顺序重算"
             "（原文未改的章节复用上次的抽取结果）。[/]"
+        )
+    if result.upgraded_from is not None:
+        console.print(
+            f"[yellow]有新的抽取种类，已从第 {result.upgraded_from} 章起按顺序重读"
+            "（已有的抽取结果复用，只有新种类调用模型）。[/]"
         )
     console.print(
         f"抽取完成：成功 {result.extracted} 章，失败 {result.failed} 章"
@@ -144,10 +176,16 @@ def _failure_summary(failures: dict[str, int]) -> str:
 async def _check(settings: Settings, factory: Factory, book_id: uuid.UUID) -> None:
     async with factory() as session:
         result = await checks.run_checks(session, user_id=settings.dev_user_id, book_id=book_id)
+    _print_checks(result)
+
+
+def _print_checks(result: checks.CheckResult) -> None:
     console.print(
         f"检查完成：发现 {result.found} 个问题（新增 {result.new}），"
         f"{result.resolved} 个旧问题已不再出现。"
     )
+    if result.kept_unextracted:
+        console.print(f"[yellow]⚠ {escape(chapters.kept_warning(result))}[/]")
 
 
 Verify = Annotated[
@@ -183,6 +221,10 @@ async def _verify(
             factory, llm, settings, user_id=user_id, book_id=book_id, issue_ids=issue_ids,
             again=again, archival=platform_archival(settings),
         )  # fmt: skip
+    _print_verification(result)
+
+
+def _print_verification(result: verification.VerifyResult) -> None:
     for outcome in result.verified:
         console.print(f"\n{escape(outcome.description)}")
         console.print(f"   {_verdict_line(outcome.verification)}")
@@ -216,11 +258,7 @@ def ingest(
         console.print(
             f"作品 ID：[bold]{job.book_id}[/]，共 {len(job.chapters)} 章，{job.total_chars} 字"
         )
-        await _extract(settings, factory, job.book_id)
-        if check:
-            await _check(settings, factory, job.book_id)
-            if verify:
-                await _verify(settings, factory, job.book_id)
+        await _process(settings, factory, job.book_id, check=check, verify=verify)
 
     _run(main)
 
@@ -235,11 +273,7 @@ def resume(
 
     async def main(settings: Settings, factory: Factory) -> None:
         book_id = await _resolve_book(factory, settings.dev_user_id, book)
-        await _extract(settings, factory, book_id)
-        if check:
-            await _check(settings, factory, book_id)
-            if verify:
-                await _verify(settings, factory, book_id)
+        await _process(settings, factory, book_id, check=check, verify=verify)
 
     _run(main)
 
@@ -297,7 +331,13 @@ def verify_cmd(
         list[str] | None,
         typer.Option(help="只核实这个问题（报告里 # 后的编号，可只写前几位；可重复）"),
     ] = None,
-    again: Annotated[bool, typer.Option(help="已有有效结论的也重新核实")] = False,
+    again: Annotated[
+        bool,
+        typer.Option(
+            help="已有有效结论的也重新核实。模型、prompt 和原文都没变时请求会命中缓存，"
+            "得到同样的结论（不花钱）；主要用于换了模型或 prompt 之后"
+        ),
+    ] = False,
 ) -> None:
     """用校验 agent 回原文核实报告里的问题（真矛盾 / 误报 / 需作者确认）。"""
 
@@ -365,14 +405,20 @@ def _change(
         user_id = settings.dev_user_id
         book_id = await _resolve_book(factory, user_id, book)
         llm = platform_client(settings, DbCallStore(factory, user_id=user_id, book_id=book_id))
-        with console.status("处理中（原文未改的章节复用上次的抽取结果）…"):
-            result = await operation(
-                factory, llm, settings, user_id=user_id, book_id=book_id,
-                archival=platform_archival(settings), **kwargs,
+        with console.status("处理中（原文未改的章节复用上次的抽取结果）…") as status:
+
+            def on_stage(stage: pipeline.Stage) -> None:
+                if stage in _STAGE_LABEL:
+                    status.update(_STAGE_LABEL[stage])
+
+            outcome = await pipeline.change_book(
+                operation, factory, llm, settings, user_id=user_id, book_id=book_id,
+                archival=platform_archival(settings), verify=verify, on_stage=on_stage,
+                **kwargs,
             )  # fmt: skip
-        _print_change(result)
-        if verify and not result.dry_run:
-            await _verify(settings, factory, book_id)
+        _print_change(outcome.change)
+        if outcome.verification is not None:
+            _print_verification(outcome.verification)
 
     _run(main)
 

@@ -124,7 +124,8 @@ async def test_reimport_of_same_text_is_fully_cached(factory):
     _, second, _ = await import_book(factory, backend)
 
     assert len(backend.calls) == 3
-    assert second.cache_hits == 3 and second.cost_usd == 0
+    # Both kinds of extraction (ages, character facts) are served from the cache.
+    assert second.cache_hits == second.llm_calls == 6 and second.cost_usd == 0
 
 
 async def test_rechecking_keeps_author_status_and_resolves_vanished_issues(factory):

@@ -80,3 +80,40 @@ def test_tables_added_after_0006_come_and_go(tmp_path):
     assert rows(db, f"{tables} {names}") == []
     alembic(db, "upgrade", "head")
     assert len(rows(db, f"{tables} {names}")) == 4
+
+
+def test_0014_keeps_age_extractions_and_allows_one_row_per_kind(tmp_path):
+    db = tmp_path / "m.db"
+    alembic(db, "upgrade", "0013")
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO books (id, user_id, title) VALUES (?, ?, '测试')", (BOOK, USER))
+        conn.execute(
+            "INSERT INTO chapters (id, user_id, book_id, number, title, content, char_count,"
+            " content_hash, status) VALUES (?, ?, ?, 1, '第一章', '正文', 2, 'h', 'extracted')",
+            (CHAPTER, USER, BOOK),
+        )
+        conn.execute(
+            "INSERT INTO chapter_extractions (id, user_id, book_id, chapter_id, content_hash,"
+            " version, result) VALUES (?, ?, ?, ?, 'h', 'v', '{}')",
+            (FACT, USER, BOOK, CHAPTER),
+        )
+    alembic(db, "upgrade", "0014")
+    assert rows(db, "SELECT id, kind FROM chapter_extractions") == [(FACT, "age")]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO chapter_extractions (id, user_id, book_id, chapter_id, content_hash,"
+            " version, result, kind) VALUES (?, ?, ?, ?, 'h', 'v', '{}', 'traits')",
+            (CHARACTER, USER, BOOK, CHAPTER),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO chapter_extractions (id, user_id, book_id, chapter_id,"
+                " content_hash, version, result, kind) VALUES (?, ?, ?, ?, 'h', 'v', '{}',"
+                " 'traits')",
+                ("f" * 32, USER, BOOK, CHAPTER),
+            )
+            raise AssertionError("two rows of one kind for one chapter")
+        except sqlite3.IntegrityError:
+            pass
+    alembic(db, "downgrade", "0013")
+    assert rows(db, "SELECT id FROM chapter_extractions") == [(FACT,)]

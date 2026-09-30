@@ -10,7 +10,7 @@ from decimal import Decimal
 from importlib import resources
 from typing import Any
 
-from webfic.extraction.locator import locate
+from webfic.extraction.locator import locate, normalized
 from webfic.extraction.schemas import (
     AGE_SCHEMA_VERSION,
     SHORT_SPAN_YEARS,
@@ -56,6 +56,7 @@ class ChapterExtraction:
     cost_usd: Decimal = Decimal(0)
     llm_calls: int = 0
     cache_hits: int = 0
+    reused: bool = False  # read back from storage, not from the model
 
 
 def extraction_version(system_prompt: str, chunk_size: int, chunk_overlap: int) -> str:
@@ -65,22 +66,26 @@ def extraction_version(system_prompt: str, chunk_size: int, chunk_overlap: int) 
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
-def dump_extraction(extraction: ChapterExtraction) -> dict[str, Any]:
-    """The reusable part of an extraction (not its cost), as JSON."""
+def dump_extraction(extraction: ChapterExtraction, offset: int = 0) -> dict[str, Any]:
+    """The reusable part of an extraction (not its cost), as JSON. Positions are stored
+    in the coordinates of the extracted text, `offset` being where it starts in the
+    chapter: the author's notes before the story may change while the story does not,
+    and the stored reading must then follow the story (step 4.6)."""
     return {
+        "coords": "story",
         "ages": [
             {
                 "statement": a.statement.model_dump(mode="json"),
-                "start": a.char_start,
-                "end": a.char_end,
+                "start": a.char_start - offset,
+                "end": a.char_end - offset,
             }
             for a in extraction.ages
         ],
         "elapsed": [
             {
                 "statement": e.statement.model_dump(mode="json"),
-                "start": e.char_start,
-                "end": e.char_end,
+                "start": e.char_start - offset,
+                "end": e.char_end - offset,
             }
             for e in extraction.elapsed
         ],
@@ -89,21 +94,39 @@ def dump_extraction(extraction: ChapterExtraction) -> dict[str, Any]:
     }
 
 
-def load_extraction(data: dict[str, Any]) -> ChapterExtraction:
-    """A stored extraction; it made no model calls this time."""
+def load_extraction(data: dict[str, Any], offset: int = 0) -> ChapterExtraction:
+    """A stored extraction, positioned for a story now starting at `offset`; it made no
+    model calls this time. Rows stored before step 4.6 hold chapter positions and are
+    returned as they are (`positions_hold` tells whether they still fit)."""
+    shift = offset if data.get("coords") == "story" else 0
     return ChapterExtraction(
         ages=[
-            LocatedAge(AgeStatement.model_validate(a["statement"]), a["start"], a["end"])
+            LocatedAge(
+                AgeStatement.model_validate(a["statement"]), a["start"] + shift, a["end"] + shift
+            )
             for a in data["ages"]
         ],
         elapsed=[
             LocatedElapsed(
-                ElapsedTimeStatement.model_validate(e["statement"]), e["start"], e["end"]
+                ElapsedTimeStatement.model_validate(e["statement"]),
+                e["start"] + shift,
+                e["end"] + shift,
             )
             for e in data["elapsed"]
         ],
         revealed_names=[RevealedName.model_validate(r) for r in data["revealed_names"]],
         dropped=list(data["dropped"]),
+    )
+
+
+def positions_hold(extraction: ChapterExtraction, content: str) -> bool:
+    """Whether every statement's quote is still where the extraction says it is in the
+    chapter (punctuation and spacing aside, as quotes are located)."""
+    located = [(a.statement.raw_text, a.char_start, a.char_end) for a in extraction.ages]
+    located += [(e.statement.raw_text, e.char_start, e.char_end) for e in extraction.elapsed]
+    return all(
+        0 <= start <= end <= len(content) and normalized(content[start:end]) == normalized(quote)
+        for quote, start, end in located
     )
 
 

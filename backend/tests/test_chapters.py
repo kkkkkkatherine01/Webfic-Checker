@@ -107,7 +107,9 @@ async def test_replacing_a_chapter_fixes_a_contradiction(world):
     assert result.issues_added == []
     # Chapters 3 and 4 are recomputed; only the changed one is read by the model again,
     # the unchanged one reuses its stored extraction.
-    assert (result.extracted, result.llm_calls, result.reused) == (2, 1, 1)
+    assert (result.extracted, result.reused) == (2, 1)
+    # One call per kind of extraction for the changed chapter (step 5-1).
+    assert result.calls_by_kind == {"age": 1, "character_facts": 1}
     assert len(world.backend.calls) == calls + 1
     assert await world.issues() == [([2, 3], IssueStatus.RESOLVED)]
 
@@ -275,3 +277,136 @@ async def test_blank_text_is_refused_and_nothing_changes(world):
         with pytest.raises(InvalidEdit):
             await imports.create_import_job(session, user_id=USER, title="空", text="\n \n")
     assert await dump(world.factory) == before
+
+
+def flaky(world, needle):
+    """Make the fake model fail (rate limit) on chapters containing `needle` while
+    `failing["on"]`."""
+    from webfic.llm.base import ProviderError, ProviderErrorKind
+
+    failing = {"on": True}
+    answer = world.backend._respond
+
+    def respond_or_fail(messages):
+        if failing["on"] and needle in messages[1].content:
+            raise ProviderError(ProviderErrorKind.RATE_LIMIT, "429")
+        return answer(messages)
+
+    world.backend._respond = respond_or_fail
+    return failing
+
+
+async def test_a_failed_chapter_does_not_close_its_issues(world):
+    # Step 4.6: a chapter that could not be extracted has no facts this time; its issues
+    # are not fixed, they are unknown, so they keep the author's status.
+    async with world.factory() as session:
+        await session.execute(update(IssueRow).values(status=IssueStatus.ACKNOWLEDGED))
+        await session.commit()
+    failing = flaky(world, "林远今年16岁，个子不高")
+    result = await world.do(chapters.replace_chapter, number=3, content="林远今年16岁，个子不高。")
+    assert result.failed == 1 and result.issues_removed == []
+    assert any("保持原状态" in w for w in result.warnings)
+    assert await world.issues() == [([2, 3], IssueStatus.ACKNOWLEDGED)]
+    failing["on"] = False
+    await imports.run_import_job(
+        world.factory, world.llm, Settings(), user_id=USER, book_id=world.book_id
+    )
+    async with world.factory() as session:
+        await checks.run_checks(session, user_id=USER, book_id=world.book_id)
+    assert await world.issues() == [([2, 3], IssueStatus.ACKNOWLEDGED)]
+
+
+async def test_an_issue_that_comes_back_gets_its_status_back(world):
+    async with world.factory() as session:
+        await session.execute(update(IssueRow).values(status=IssueStatus.ACKNOWLEDGED))
+        await session.commit()
+    await world.do(chapters.replace_chapter, number=3, content="林远今年21岁。")
+    assert await world.issues() == [([2, 3], IssueStatus.RESOLVED)]
+    await world.do(chapters.replace_chapter, number=3, content="林远今年16岁。")
+    assert await world.issues() == [([2, 3], IssueStatus.ACKNOWLEDGED)]
+    # Resolved by the author, not by a check: it comes back open.
+    async with world.factory() as session:
+        await session.execute(update(IssueRow).values(status=IssueStatus.RESOLVED))
+        await session.commit()
+    async with world.factory() as session:
+        await checks.run_checks(session, user_id=USER, book_id=world.book_id)
+    assert await world.issues() == [([2, 3], IssueStatus.OPEN)]
+
+
+async def test_running_one_checker_leaves_the_others_issues_alone(world):
+    # Step 5-0: a checker that did not run has not "stopped finding" its issues.
+    class Quiet:
+        name = "quiet"
+
+        async def check(self, session, *, user_id, book_id):
+            return []
+
+    async with world.factory() as session:
+        result = await checks.run_checks(
+            session, user_id=USER, book_id=world.book_id, checkers=[Quiet()]
+        )
+    assert result.resolved == 0 and result.by_checker == {"quiet": 0}
+    assert await world.issues() == [([2, 3], IssueStatus.OPEN)]
+    async with world.factory() as session:
+        result = await checks.run_checks(session, user_id=USER, book_id=world.book_id)
+    assert result.by_checker == {"age_arithmetic": 1, "character_facts": 0}
+
+
+class CountingKind:
+    """A second kind of extraction that reads nothing and counts its calls."""
+
+    name = "counting"
+
+    def __init__(self):
+        self.calls = []
+
+    def version(self, settings):
+        return "v1"
+
+    async def extract(self, llm, *, chapter_number, text, known_characters, settings, offset):
+        from webfic.extraction.extractor import ChapterExtraction
+
+        self.calls.append(chapter_number)
+        return ChapterExtraction(llm_calls=1)
+
+    def dump(self, reading, offset):
+        return {}
+
+    def load(self, data, offset):
+        from webfic.extraction.extractor import ChapterExtraction
+
+        return ChapterExtraction()
+
+    def positions_hold(self, reading, content):
+        return True
+
+    def reveals(self, reading):
+        return []
+
+    def rows(self, reading, *, resolve, name_of, where):
+        from webfic.extraction.kinds import Rows
+
+        return Rows()
+
+
+async def test_a_new_kind_of_extraction_reads_the_book_again_reusing_the_others(world, monkeypatch):
+    # Step 5-0: a book read before a kind existed is read again in order; its age
+    # readings are reused, only the new kind asks the model.
+    from webfic.extraction.kinds import KINDS
+
+    counting = CountingKind()
+    monkeypatch.setattr(imports, "KINDS", [*KINDS, counting])
+    calls = len(world.backend.calls)
+    result = await imports.run_import_job(
+        world.factory, world.llm, Settings(), user_id=USER, book_id=world.book_id
+    )
+    assert result.upgraded_from == 1 and result.extracted == 4
+    assert counting.calls == [1, 2, 3, 4] and len(world.backend.calls) == calls
+    assert result.calls_by_kind == {"age": 0, "character_facts": 0, "counting": 4}
+    again = await imports.run_import_job(
+        world.factory, world.llm, Settings(), user_id=USER, book_id=world.book_id
+    )
+    assert again.upgraded_from is None and again.extracted == 0
+    async with world.factory() as session:
+        await checks.run_checks(session, user_id=USER, book_id=world.book_id)
+    assert await world.issues() == [([2, 3], IssueStatus.OPEN)]

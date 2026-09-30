@@ -350,3 +350,27 @@ async def test_one_oversized_request_ends_the_run(factory):
     )
     assert result.status == "budget_exhausted" and len(backend.calls) == 1
     assert "单轮输入" in result.error
+
+
+async def test_an_unexpected_error_marks_the_run_failed_and_is_raised(factory):
+    book_id = await book(factory)
+
+    async def broken(ctx, args):
+        raise KeyError("bug")
+
+    tools = ToolRegistry(
+        [
+            Tool("list_facts", "x", FactsArgs, run=broken),
+            Tool("answer", "a", AnswerArgs, terminal=True),
+        ]
+    )
+    with pytest.raises(KeyError):
+        await run_agent(
+            agent_llm(ScriptedBackend([LOOK])), agent="test", system="s", task="t",
+            tools=tools, context=ToolContext(factory=factory, user_id=USER, book_id=book_id),
+            trace=TraceWriter(factory, user_id=USER, book_id=book_id),
+        )  # fmt: skip
+    async with factory() as session:
+        run_row = await session.scalar(select(AgentRunRow))
+    assert run_row.status == "failed" and "KeyError" in run_row.error
+    assert (await steps(factory, run_row.id))[-1].kind == "error"

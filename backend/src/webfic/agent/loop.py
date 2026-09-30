@@ -90,55 +90,69 @@ async def run_agent(
     result: dict[str, Any] | None = None
     error: str | None = None
 
-    while status is None:
-        if why := spend.exceeded(budget):
-            status, error = "budget_exhausted", why
-            break
-        visible, folded = fold(messages, keep_turns, labels)
-        if progress_note and spend.turns:
-            visible.append(ChatMessage("user", _progress(spend, budget, terminal)))
-        started = time.monotonic()
-        try:
-            turn = await llm.chat(
-                tier=tier, messages=visible, tools=tools.specs(), purpose=f"agent.{agent}"
-            )
-        except ProviderError as exc:
-            await trace.step(kind="llm", name="error", input=None, output=None, error=str(exc))
-            if exc.kind == ProviderErrorKind.AUTH:
-                await _finish(trace, "failed", None, str(exc), spend)
-                raise
-            status, error = "failed", str(exc)
-            break
-        spend.add_turn(turn.usage, turn.cost_usd)
-        await trace.step(
-            kind="llm", name=turn.model,
-            input={"messages": len(visible), "folded": folded},
-            output={
-                "text": turn.text, "reasoning": turn.reasoning,
-                "tool_calls": [{"name": c.name, "arguments": c.arguments} for c in turn.tool_calls],
-                "cache_hit": turn.cache_hit,
-            },
-            input_tokens=turn.usage.input_tokens, output_tokens=turn.usage.output_tokens,
-            cost_usd=turn.cost_usd, latency_ms=int((time.monotonic() - started) * 1000),
-        )  # fmt: skip
-        messages.append(ChatMessage("assistant", turn.text, tool_calls=turn.tool_calls))
-        if not turn.tool_calls:
-            messages.append(ChatMessage("user", NUDGE.format(terminal=terminal)))
-            continue
-
-        for call in turn.tool_calls:
-            spend.tool_calls += 1
-            labels[call.id] = f"{call.name} {call.arguments[:80]}"
-            outcome = await _call(call, tools, context, state, trace)
-            messages.append(ChatMessage("tool", outcome.reply, tool_call_id=call.id))
-            if outcome.accepted is not None:
-                status, result = "done", outcome.accepted
+    try:
+        while status is None:
+            if why := spend.exceeded(budget):
+                status, error = "budget_exhausted", why
                 break
-            if outcome.rejected:
-                rejections += 1
-                if rejections > MAX_GUARD_REJECTIONS:
-                    status, error = "guard_failed", outcome.reply
+            visible, folded = fold(messages, keep_turns, labels)
+            if progress_note and spend.turns:
+                visible.append(ChatMessage("user", _progress(spend, budget, terminal)))
+            started = time.monotonic()
+            try:
+                turn = await llm.chat(
+                    tier=tier, messages=visible, tools=tools.specs(), purpose=f"agent.{agent}"
+                )
+            except ProviderError as exc:
+                await trace.step(kind="llm", name="error", input=None, output=None, error=str(exc))
+                if exc.kind == ProviderErrorKind.AUTH:
+                    await _finish(trace, "failed", None, str(exc), spend)
+                    raise
+                status, error = "failed", str(exc)
+                break
+            spend.add_turn(turn.usage, turn.cost_usd)
+            await trace.step(
+                kind="llm", name=turn.model,
+                input={"messages": len(visible), "folded": folded},
+                output={
+                    "text": turn.text, "reasoning": turn.reasoning,
+                    "tool_calls": [
+                        {"name": c.name, "arguments": c.arguments} for c in turn.tool_calls
+                    ],
+                    "cache_hit": turn.cache_hit,
+                },
+                input_tokens=turn.usage.input_tokens, output_tokens=turn.usage.output_tokens,
+                cost_usd=turn.cost_usd, latency_ms=int((time.monotonic() - started) * 1000),
+            )  # fmt: skip
+            messages.append(ChatMessage("assistant", turn.text, tool_calls=turn.tool_calls))
+            if not turn.tool_calls:
+                messages.append(ChatMessage("user", NUDGE.format(terminal=terminal)))
+                continue
+
+            for call in turn.tool_calls:
+                spend.tool_calls += 1
+                labels[call.id] = f"{call.name} {call.arguments[:80]}"
+                outcome = await _call(call, tools, context, state, trace)
+                messages.append(ChatMessage("tool", outcome.reply, tool_call_id=call.id))
+                if outcome.accepted is not None:
+                    status, result = "done", outcome.accepted
                     break
+                if outcome.rejected:
+                    rejections += 1
+                    if rejections > MAX_GUARD_REJECTIONS:
+                        status, error = "guard_failed", outcome.reply
+                        break
+
+    except ProviderError:
+        raise  # an authentication error, already recorded above
+    except Exception as exc:
+        # A bug, not the model's doing: record where the run stopped, then let it
+        # surface instead of leaving the run 'running' forever (step 4.6).
+        why = f"{type(exc).__name__}: {exc}"
+        await trace.step(kind="error", name=type(exc).__name__, input=None, output=None,
+                         error=why)  # fmt: skip
+        await _finish(trace, "failed", None, why, spend)
+        raise
 
     await _finish(trace, status, result, error, spend)
     return AgentResult(run_id=trace.run_id, status=status, result=result, error=error, spend=spend)

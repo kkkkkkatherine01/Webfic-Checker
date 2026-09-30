@@ -151,6 +151,27 @@ def test_a_stored_extraction_round_trips():
     assert again.revealed_names == original.revealed_names and again.dropped == ["幻觉"]
     assert again.llm_calls == 0
     assert extraction_version("p", 8000, 500) != extraction_version("p", 8000, 400)
+    # Stored in story coordinates (step 4.6): read for a story that now starts later,
+    # every position moves with it; a row from before 4.6 keeps its positions.
+    stored = dump_extraction(original, offset=3)
+    moved = load_extraction(stored, offset=10)
+    assert [(a.char_start, a.char_end) for a in moved.ages] == [(10, 16)]
+    assert [(e.char_start, e.char_end) for e in moved.elapsed] == [(7, 10)]
+    old_row = {k: v for k, v in dump_extraction(original).items() if k != "coords"}
+    assert load_extraction(old_row, offset=10).ages == original.ages
+
+
+def test_stored_positions_are_checked_against_the_chapter():
+    from webfic.extraction.extractor import ChapterExtraction, LocatedAge, positions_hold
+    from webfic.extraction.schemas import AgeStatement
+
+    reading = ChapterExtraction(
+        ages=[LocatedAge(AgeStatement(mention="林远", raw_text="林远今年十八岁",
+                                      statement_type="absolute_age", value=18), 2, 10)]
+    )  # fmt: skip
+    assert positions_hold(reading, "序。林远，今年十八岁。")  # punctuation aside
+    assert not positions_hold(reading, "这是序言。林远今年十八岁。")
+    assert not positions_hold(reading, "短")
 
 
 # --- step 3.9 -------------------------------------------------------------------------

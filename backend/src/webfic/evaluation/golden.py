@@ -7,7 +7,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from webfic.checkers.types import Confidence
+from webfic.checkers.types import Confidence, IssueType
 from webfic.extraction.locator import locate
 from webfic.extraction.schemas import LifeStage, StatementType
 from webfic.ingest.splitter import RawChapter, split_chapters
@@ -21,6 +21,9 @@ class _IssueSpec(BaseModel):
     character: str
     chapters: list[int] | list[list[int]] = Field(min_length=1)
     note: str = ""
+    # The kind of issue (webfic.checkers.types.IssueType); ages by default. A kinship
+    # issue names either of the two characters.
+    type: str = IssueType.CHARACTER_AGE.value
 
     def endpoint_options(self) -> set[tuple[int, int]]:
         options = self.chapters if isinstance(self.chapters[0], list) else [self.chapters]
@@ -67,11 +70,50 @@ class Trap(BaseModel):
     note: str = ""
 
 
+class ExpectedTrait(BaseModel):
+    """A fixed feature of appearance (step 5-1)."""
+
+    chapter: int
+    quote: str
+    character: str
+    attribute: Literal["eye_color", "hair_color", "mark"]
+    value: str  # a colour word, or "部位·类型" for a mark
+    flashback: bool = False
+    speculative: bool = False
+    disguised: bool = False
+
+
+class ExpectedKinship(BaseModel):
+    """`character` is the `relation` of `other` (webfic.facts.kinship.RELATIONS); the
+    same fact stated the other way round counts too."""
+
+    chapter: int
+    quote: str
+    character: str
+    other: str
+    relation: str
+
+
+class ExpectedDeath(BaseModel):
+    chapter: int
+    quote: str
+    character: str
+    speculative: bool = False  # rumour, presumed dead
+
+
 class ExpectedFacts(BaseModel):
     ages: list[ExpectedAge] = []
     elapsed: list[ExpectedElapsed] = []
     not_ages: list[Trap] = []  # must not be extracted as any age statement
     not_elapsed: list[Trap] = []  # must not be extracted as an "advance" time span
+    # Character facts (step 5-1).
+    traits: list[ExpectedTrait] = []
+    kinship: list[ExpectedKinship] = []
+    deaths: list[ExpectedDeath] = []
+    not_traits: list[Trap] = []  # no comparable feature here (disguise, guess, a group...)
+    not_kinship: list[Trap] = []  # no blood relation here (politeness, sworn kin...)
+    not_deaths: list[Trap] = []  # no certain death here (rumour, feigned death...)
+    not_presence: list[Trap] = []  # nobody appears in person here (dream, memory...)
 
 
 class RetrievalQuestion(BaseModel):
@@ -97,6 +139,9 @@ class Golden(BaseModel):
     characters: dict[str, list[str]]  # standard name -> other names
     issues: list[ExpectedIssue] = []
     allowed: list[AllowedIssue] = []
+    # Reports the rules cannot avoid but the text explains (a revealed parentage, a
+    # dye): not the checker's false alarms; the verify agent should dismiss them.
+    dismiss: list[AllowedIssue] = []
     not_aliases: list[str] = []  # must not be any character's name or alias
     facts: ExpectedFacts = ExpectedFacts()
     retrieval: list[RetrievalQuestion] = []
@@ -109,8 +154,15 @@ class Golden(BaseModel):
                 if n in seen and seen[n] != name:
                     raise ValueError(f"称呼「{n}」同时属于「{seen[n]}」和「{name}」")
                 seen[n] = name
-        refs = [i.character for i in self.issues] + [a.character for a in self.allowed]
+        refs = [i.character for i in [*self.issues, *self.allowed, *self.dismiss]]
         refs += [a.character for a in self.facts.ages]
+        refs += [t.character for t in self.facts.traits]
+        refs += [k.character for k in self.facts.kinship] + [k.other for k in self.facts.kinship]
+        refs += [d.character for d in self.facts.deaths]
+        kinds = {t.value for t in IssueType}
+        for issue in [*self.issues, *self.allowed, *self.dismiss]:
+            if issue.type not in kinds:
+                raise ValueError(f"未知的矛盾类型：{issue.type}")
         refs += [q.character for q in self.retrieval if q.character]
         for ref in refs:
             if ref not in self.characters:
@@ -172,9 +224,15 @@ def _check_quotes(story: Story) -> None:
     problems: list[str] = []
     n = len(story.chapters)
 
-    quoted = [(a.chapter, a.quote) for a in g.facts.ages]
-    quoted += [(e.chapter, e.quote) for e in g.facts.elapsed]
-    quoted += [(t.chapter, t.quote) for t in [*g.facts.not_ages, *g.facts.not_elapsed]]
+    f = g.facts
+    quoted = [(a.chapter, a.quote) for a in f.ages]
+    quoted += [(e.chapter, e.quote) for e in f.elapsed]
+    quoted += [(t.chapter, t.quote) for t in [*f.not_ages, *f.not_elapsed]]
+    quoted += [(x.chapter, x.quote) for x in [*f.traits, *f.kinship, *f.deaths]]
+    quoted += [
+        (t.chapter, t.quote)
+        for t in [*f.not_traits, *f.not_kinship, *f.not_deaths, *f.not_presence]
+    ]
     quoted += [(e.chapter, e.quote) for q in g.retrieval for e in q.expect]
     for chapter, quote in quoted:
         if not 1 <= chapter <= n:
@@ -182,7 +240,7 @@ def _check_quotes(story: Story) -> None:
         elif locate(story.chapters[chapter - 1].content, quote) is None:
             problems.append(f"第 {chapter} 章找不到引文：{quote}")
 
-    for issue in [*g.issues, *g.allowed]:
+    for issue in [*g.issues, *g.allowed, *g.dismiss]:
         problems += [
             f"矛盾引用了不存在的第 {c} 章" for c in issue.all_chapters() if not 1 <= c <= n
         ]
@@ -191,8 +249,19 @@ def _check_quotes(story: Story) -> None:
         raise GoldenError(f"{story.id}:\n  " + "\n  ".join(problems))
 
 
+def unconverted(directory: Path) -> bool:
+    """A story written with its answers in free form (`answers.txt`) and not yet turned
+    into expected.yaml: a holdout still being written or not yet converted (step 5-1).
+    Skipped without reading it."""
+    return (directory / "answers.txt").exists() and not (directory / "expected.yaml").exists()
+
+
 def discover(golden_dir: Path, only: list[str] | None = None) -> list[Path]:
-    dirs = sorted(p for p in golden_dir.iterdir() if p.is_dir() and p.name.startswith("story"))
+    dirs = sorted(
+        p
+        for p in golden_dir.iterdir()
+        if p.is_dir() and p.name.startswith("story") and not unconverted(p)
+    )
     if only:
         wanted = {o if o.startswith("story") else f"story{o.zfill(2)}" for o in only}
         dirs = [d for d in dirs if d.name in wanted]

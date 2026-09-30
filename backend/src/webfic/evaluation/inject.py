@@ -21,7 +21,7 @@ import re
 import uuid
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
@@ -29,19 +29,22 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from webfic.checkers.age import CHECKER_NAME as AGE_CHECKER
 from webfic.checkers.age import AgeFact, ElapsedFact, _is_comparable, _Timeline
+from webfic.checkers.character_facts import CharFact
+from webfic.checkers.registry import load_age_facts, load_character_facts
 from webfic.checkers.types import Confidence
 from webfic.config import Settings
 from webfic.db.models import Book, Chapter, Character, CharacterAlias, ElapsedTimeFactRow, FactRow
 from webfic.db.session import rolled_back
+from webfic.evaluation import inject_facts as fx
 from webfic.evaluation.metrics import Ratio
 from webfic.evaluation.realtext import shushan_book, webnovelbench_books
 from webfic.extraction.extractor import extraction_version, load_prompt
 from webfic.facts.registry import AGE
 from webfic.ingest.splitter import parse_number
 from webfic.llm.base import LLMClient
-from webfic.services import chapters, checks, imports, reports
-from webfic.services.checks import _load_age_facts
+from webfic.services import chapters, imports, reports
 from webfic.services.reports import IssueView
 
 INJECT_USER = uuid.UUID("00000000-0000-0000-0000-00000000e7a3")
@@ -70,6 +73,11 @@ PER_BOOK = 3  # at most this many injections of one kind in one book...
 PER_BOOK_BY_KIND = {
     "modify_backwards": 5, "modify_jump": 5, "control_future": 5, "control_future_new": 5,
 }  # fmt: skip
+# Character facts (step 5-1c), after the age kinds: the seeded plan of the age kinds
+# stays what it was.
+KINDS |= fx.KINDS
+DETECT = (*DETECT, *fx.DETECT)
+QUOTAS |= fx.QUOTAS
 FUTURE_PER_PAIR = 3  # a future duration can go on any line between two ages
 # Ages that do not make a sound anchor or target (steps 4-3 and 4.5): an approximate age
 # extracted as an exact number, an idiomatic one ("年才半百"), or one inside hearsay
@@ -167,15 +175,27 @@ async def prepare(
                         session, user_id=INJECT_USER, title=title, text=base.text
                     )
                     book_id = job.book_id
+            llm = make_llm(book_id)
             result = await imports.run_import_job(
-                factory, make_llm(book_id), settings, user_id=INJECT_USER, book_id=book_id
+                factory, llm, settings, user_id=INJECT_USER, book_id=book_id
             )
-            async with factory() as session:
-                await checks.run_checks(session, user_id=INJECT_USER, book_id=book_id)
+            # A book prepared before a change to what is sent to extraction (the
+            # author's notes of step 4.5) would otherwise keep its old reading, and every
+            # dry run would recompute only the chapters after the edit the new way (step
+            # 4.6). Stored note scans are reused, so an up-to-date book costs nothing.
+            notes = await chapters.rescan_author_notes(
+                factory, llm, settings, user_id=INJECT_USER, book_id=book_id
+            )
             books[base.name] = book_id
             on_progress(
                 f"[{n}/{len(items)}] {base.name}：抽取 {result.extracted} 章"
                 f"（复用 {result.reused}，失败 {result.failed}），${result.cost_usd:.4f}"
+                + (
+                    f"；作者注变化后重算 {notes.extracted} 章（复用 {notes.reused}），"
+                    f"${notes.cost_usd:.4f}"
+                    if notes.extracted
+                    else ""
+                )
             )
 
     await asyncio.gather(*(one(n, b) for n, b in enumerate(items, start=1)))
@@ -194,13 +214,18 @@ class BookView:
     ages: list[AgeFact]
     elapsed: list[ElapsedFact]
     issues: list[IssueView]  # the open report on the original text
+    char_facts: list[CharFact] = field(default_factory=list)  # step 5-1c
+    char_names: dict[str, uuid.UUID] = field(default_factory=dict)  # name/alias -> character
+    all_names: dict[uuid.UUID, list[str]] = field(default_factory=dict)  # every kind's names
 
     def in_issue(self, fact: AgeFact) -> bool:
+        """Whether an age is already in a reported age issue (anchors must not be)."""
         return any(
             e.chapter_number == fact.chapter_number
             and e.char_start < fact.char_end
             and fact.char_start < e.char_end
             for issue in self.issues
+            if issue.checker == AGE_CHECKER
             for e in issue.evidence
         )
 
@@ -211,22 +236,32 @@ async def load_view(session: AsyncSession, name: str, book_id: uuid.UUID) -> Boo
             Chapter.user_id == INJECT_USER, Chapter.book_id == book_id
         )
     )
+    # Age injections use the names age extraction knows (it named them, or the author
+    # did): other kinds' aliases would move the seeded plan (step 5-1c). Character-fact
+    # injections use every name.
     names: dict[uuid.UUID, list[str]] = {}
+    all_names: dict[uuid.UUID, list[str]] = {}
     for c in await session.scalars(
         select(Character).where(Character.user_id == INJECT_USER, Character.book_id == book_id)
     ):
-        names[c.id] = [c.canonical_name]
+        all_names[c.id] = [c.canonical_name]
+        if c.kind == AGE.name:
+            names[c.id] = [c.canonical_name]
     for a in await session.scalars(
         select(CharacterAlias).where(
             CharacterAlias.user_id == INJECT_USER, CharacterAlias.book_id == book_id
         )
     ):
-        names.setdefault(a.character_id, []).append(a.alias)
-    ages, elapsed = await _load_age_facts(session, INJECT_USER, book_id)
+        all_names.setdefault(a.character_id, []).append(a.alias)
+        if a.character_id in names and (a.kind == AGE.name or a.source == "user"):
+            names[a.character_id].append(a.alias)
+    ages, elapsed = await load_age_facts(session, INJECT_USER, book_id)
+    char_facts, char_names = await load_character_facts(session, INJECT_USER, book_id)
     report = await reports.get_report(session, user_id=INJECT_USER, book_id=book_id)
     return BookView(
-        name, book_id, {n: c for n, c in rows.all()}, names, ages, elapsed, report.issues
-    )
+        name, book_id, {n: c for n, c in rows.all()}, names, ages, elapsed, report.issues,
+        char_facts, char_names, all_names,
+    )  # fmt: skip
 
 
 # --- numbers in the text's style -----------------------------------------------------------
@@ -272,6 +307,9 @@ class Injection(BaseModel):
     expect: Confidence | None  # None: nothing may be reported
     distance: int  # chapters between ref and injection
     detail: str
+    # Whose issues this injection is scored on (step 5-1: another checker's issues that
+    # an edit happens to add are not this injection's detections or collateral).
+    checker: str = AGE_CHECKER
 
 
 def _pos(fact: AgeFact) -> tuple[int, int]:
@@ -419,6 +457,8 @@ def _insert(view: BookView, f: AgeFact, point, kind: str, timeline: _Timeline, r
 
 def candidates(view: BookView, kind: str, rng: random.Random) -> list[Injection]:
     """Every place in the book where an injection of `kind` can be made."""
+    if kind in fx.KINDS:
+        return fx.candidates(view, kind, rng)
     timeline = _Timeline(view.elapsed)
     found: list[Injection] = []
     by_character: dict[uuid.UUID, list[AgeFact]] = {}
@@ -522,8 +562,12 @@ class Outcome(BaseModel):
     # control_flashback), a guess only for control_speculative
     age_right: bool = False
     elapsed_on_span: list[str] = []  # kinds of time spans extracted from the injected text
+    fact_on_span: list[str] = []  # character facts extracted from the injected text (5-1c)
     cost_usd: Decimal = Decimal(0)
     llm_calls: int = 0
+
+
+FLAG_LABEL = {"disguised": "伪装", "temporary": "一时", "address": "当面称呼"}
 
 
 def _touches(e, chapter: int, start: int, end: int) -> bool:
@@ -559,8 +603,10 @@ async def run_injection(
         )  # fmt: skip
         out.failed = result.failed > 0
         out.cost_usd, out.llm_calls = result.cost_usd, result.llm_calls
+        added = [i for i in result.issues_added if i.checker == inj.checker]
+        removed = [i for i in result.issues_removed if i.checker == inj.checker]
         async with scoped() as session:
-            for issue in result.issues_added:
+            for issue in added:
                 text = f"（{issue.confidence}）{issue.description}"
                 if not any(_touches(e, inj.chapter, start, end) for e in issue.evidence):
                     out.collateral_added.append(text)
@@ -570,16 +616,24 @@ async def run_injection(
                     await _subject_names(session, issue.subjects) & set(inj.names)
                 )
                 first, last = issue.evidence[0], issue.evidence[-1]
+                # Ages: the expected pair exactly. Character facts: the injected
+                # statement reported as the expected kind of issue, against whichever
+                # statement precedes it (a pair is often stated several times in one
+                # chapter, and re-reading the chapter re-reads them all).
+                paired = (
+                    fx.EXPECTED_TYPE.get(inj.kind) == issue.issue_type
+                    if inj.kind in fx.KINDS
+                    else inj.ref is not None and _touches(first, *inj.ref)
+                )
                 if (
                     inj.expect is not None
                     and right_character
-                    and inj.ref is not None
-                    and _touches(first, *inj.ref)
+                    and paired
                     and _touches(last, inj.chapter, start, end)
                     and not out.detected
                 ):
                     out.detected, out.confidence = True, issue.confidence
-            out.removed = [f"（{i.confidence}）{i.description}" for i in result.issues_removed]
+            out.removed = [f"（{i.confidence}）{i.description}" for i in removed]
 
             ages = await session.scalars(
                 select(FactRow).where(
@@ -617,6 +671,34 @@ async def run_injection(
                 )
             )  # fmt: skip
             out.elapsed_on_span = [f"{e.kind} {e.estimated_years}" for e in spans]
+            if inj.kind in fx.KINDS:
+                facts = await session.scalars(
+                    select(FactRow).where(
+                        FactRow.user_id == INJECT_USER, FactRow.book_id == book_id,
+                        FactRow.category != AGE.name, FactRow.chapter_number == inj.chapter,
+                        FactRow.char_start < end, FactRow.char_end > start,
+                    )
+                )  # fmt: skip
+                for f in facts:
+                    names = await _subject_names(session, [str(f.character_id)])
+                    owner = (
+                        "角色对"
+                        if names & set(inj.names)
+                        else f"角色错（{'、'.join(sorted(names))}）"
+                    )
+                    flags = [
+                        label
+                        for label, on in [
+                            ("回忆", f.is_flashback), ("推测", f.is_speculative),
+                            *(((FLAG_LABEL.get(k, k), v) for k, v in (f.qualifiers or {}).items()
+                               if isinstance(v, bool))),
+                        ]
+                        if on
+                    ]  # fmt: skip
+                    out.fact_on_span.append(
+                        f"{f.category}.{f.attribute} {f.value_text or ''} {owner} {' '.join(flags)}"
+                        .strip()
+                    )  # fmt: skip
     return out
 
 
@@ -674,6 +756,12 @@ class KindMetrics(BaseModel):
 def _miss_reason(o: Outcome) -> str:
     if o.failed:
         return "该章抽取失败"
+    if o.injection.kind in fx.KINDS:
+        if not o.fact_on_span:
+            return "注入的事实没抽到"
+        if o.involving:
+            return "报出了，但两端不是预期的那一对"
+        return "抽到了但检查器没报（归属或标注不对）"
     if not o.age_on_span:
         return "注入的年龄没抽到"
     if not o.age_right:
@@ -729,6 +817,7 @@ class InjectReport(BaseModel):
     git_commit: str | None
     seed: int
     books: int
-    original_issues: int  # open issues on the original texts
+    original_issues: int  # open age issues on the original texts
+    original_char_issues: int = 0  # open character-fact issues (step 5-1)
     kinds: list[KindMetrics]
     outcomes: list[Outcome]

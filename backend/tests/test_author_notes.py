@@ -114,3 +114,19 @@ def test_the_prompt_examples_are_consistent():
         shown = {int(n) for n in re.findall(r"^\[(\d+)\]", text, re.MULTILINE)}
         labelled = {p["i"] for p in json.loads(output)["paragraphs"]}
         assert shown == labelled
+
+
+async def test_a_registered_marker_needs_a_break_after_it():
+    # Step 4.6: registering "注" must not swallow a story paragraph starting "注视着".
+    story = "林远走进山门。\n" + "他看了看四周。\n" * 300
+    looking = story + "注视着远方，林远想起自己今年三十岁了。\n他转身离开。"
+    assert (await find_author_notes(None, looking, ["注"])).ranges == []
+    noted = looking + "\n注：本章设定参考某某。"
+    ((start, end),) = (await find_author_notes(None, noted, ["注"])).ranges
+    assert noted[start:end] == "注：本章设定参考某某。"
+    for text in ("【注】本章设定参考某某。", "注 本章设定参考某某。", "注"):
+        found = (await find_author_notes(None, story + text, ["注"])).ranges
+        assert [(story + text)[a:b] for a, b in found] == [text]
+    # A marker registered with its colon is matched as written.
+    assert (await find_author_notes(None, story + "注：说明", ["注："])).ranges
+    assert not (await find_author_notes(None, story + "Notebook 在桌上", ["Note"])).ranges

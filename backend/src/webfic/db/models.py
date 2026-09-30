@@ -67,6 +67,10 @@ class Character(_Common, Base):
         ForeignKey("books.id", ondelete="CASCADE"), index=True
     )
     canonical_name: Mapped[str] = mapped_column(Text)
+    # The kind of extraction that first named the character (step 5-1). Each kind is
+    # shown only the characters it named itself (and the author's), so adding a kind
+    # never changes what the others are asked; the table itself is shared.
+    kind: Mapped[str] = mapped_column(String(32), server_default="age")
 
 
 class CharacterAlias(_Common, Base):
@@ -79,6 +83,7 @@ class CharacterAlias(_Common, Base):
     alias: Mapped[str] = mapped_column(Text)
     first_chapter: Mapped[int]
     source: Mapped[str] = mapped_column(String(16), default="extracted")
+    kind: Mapped[str] = mapped_column(String(32), server_default="age")  # as Character.kind
 
 
 class CharacterEvent(_Common, Base):
@@ -141,14 +146,17 @@ class ChapterExtractionRow(_Common, Base):
     blur what an edit really changed."""
 
     __tablename__ = "chapter_extractions"
+    # One row per chapter and kind of extraction (step 5-0: ages, then character facts...).
+    __table_args__ = (UniqueConstraint("chapter_id", "kind", name="uq_chapter_extractions_kind"),)
 
     user_id: Mapped[uuid.UUID] = mapped_column(index=True)
     book_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("books.id", ondelete="CASCADE"), index=True
     )
     chapter_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("chapters.id", ondelete="CASCADE"), unique=True
+        ForeignKey("chapters.id", ondelete="CASCADE"), index=True
     )
+    kind: Mapped[str] = mapped_column(String(32), server_default="age")
     content_hash: Mapped[str] = mapped_column(String(64))  # of the chapter text read
     version: Mapped[str] = mapped_column(String(32))  # prompt and chunking used
     result: Mapped[dict[str, Any]] = mapped_column(JsonType)
@@ -261,6 +269,9 @@ class IssueRow(_Common, Base):
     issue_type: Mapped[str] = mapped_column(String(64))
     confidence: Mapped[str] = mapped_column(String(24))
     status: Mapped[str] = mapped_column(String(16), default="open")
+    # The status an issue had when a check closed it (it no longer occurred), restored if
+    # it comes back; None if the author closed it, or it is not closed (step 4.6).
+    resolved_from: Mapped[str | None] = mapped_column(String(16))
     description: Mapped[str] = mapped_column(Text)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JsonType)
     subjects: Mapped[list[str]] = mapped_column(JsonType, default=list)  # character ids

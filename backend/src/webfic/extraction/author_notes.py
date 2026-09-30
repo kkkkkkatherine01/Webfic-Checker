@@ -27,6 +27,7 @@ from webfic.llm.base import LLMClient, LLMError, Tier
 log = logging.getLogger(__name__)
 
 PROMPT_VERSION = "author_notes_v1"
+MARKER_RULE = "markers-v2"  # how registered markers are matched (step 4.6)
 REGION = 1500  # characters examined at each end of a chapter
 MAX_PARAGRAPH = 400  # characters of each paragraph shown to the model
 
@@ -103,7 +104,10 @@ class NoteScan(BaseModel):
 def version(markers: list[str]) -> str:
     """Identifies what shapes a scan besides the chapter text: the prompt and the book's
     own markers. A stored scan is reused while this stays the same."""
-    key = PROMPT_VERSION + "|" + "|".join(sorted(m.strip() for m in markers if m.strip()))
+    own = sorted(m.strip() for m in markers if m.strip())
+    # The rule for registered markers changed in step 4.6; only books with some are
+    # scanned again (the model's part is served from the LLM cache).
+    key = PROMPT_VERSION + "|" + (f"{MARKER_RULE}|" if own else "") + "|".join(own)
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
@@ -111,11 +115,26 @@ def load_prompt(name: str = PROMPT_VERSION) -> str:
     return resources.files("webfic.extraction.prompts").joinpath(f"{name}.txt").read_text("utf-8")
 
 
+def _registered(text: str, marker: str) -> bool:
+    """Whether a paragraph opens with a marker the author registered. The rule is the
+    built-in markers': in brackets it stands on its own ("【注】"); bare, it needs a colon,
+    a space or the end of the line after it, so "注" does not take "注视着……" (step 4.6).
+    A marker registered with its colon ("注：") is matched as written."""
+    m = marker.strip().lower()
+    if not m:
+        return False
+    text = text.lower()
+    if re.match(rf"[【\[（(]\s*{re.escape(m)}\s*[】\]）)]", text):
+        return True
+    if not text.startswith(m):
+        return False
+    rest = text[len(m) :]
+    return m[-1] in ":：" or not rest or rest[0] in ":：" or rest[0].isspace()
+
+
 def _marked(p: Paragraph, markers: list[str]) -> bool:
     text = p.text.strip()
-    return bool(_MARKER.match(text)) or any(
-        m.strip() and text.lower().startswith(m.strip().lower()) for m in markers
-    )
+    return bool(_MARKER.match(text)) or any(_registered(text, m) for m in markers)
 
 
 async def find_author_notes(

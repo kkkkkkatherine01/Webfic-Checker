@@ -228,7 +228,9 @@ def _texts():
                EVAL_DIR / "external" / "shushan"]  # fmt: skip
     for folder in folders:
         if folder.exists():
-            yield from (p for p in folder.rglob("*.txt") if p.is_file())
+            # A holdout's free-form answers (step 5-1) quote text.txt, which is checked;
+            # their own wording ("血缘亲属关系") is not story text.
+            yield from (p for p in folder.rglob("*.txt") if p.is_file() and p.name != "answers.txt")
 
 
 def test_no_test_or_real_text_leaks_into_the_prompt():

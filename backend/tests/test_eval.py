@@ -268,3 +268,22 @@ async def test_runner_with_ideal_extraction_scores_perfectly(tmp_path):
     assert aggregate_story(story.id, 1, fresh).issue_hits == {
         "story01/su-age-jump": 2, "story01/lin-age-backwards": 2,
     }  # fmt: skip
+
+
+def test_run_labels_make_safe_file_names():
+    # Step 4.6: "a: b" once wrote the result into an NTFS alternate stream on Windows.
+    from webfic.evaluation.cli import _file_label
+
+    assert _file_label("4.6 control: HEAD/code?") == "4.6 control- HEAD-code-"
+    assert _file_label(r"a\b*c") == "a-b-c" and _file_label("  ") == "run"
+
+
+def test_a_story_whose_answers_are_not_converted_yet_is_skipped(tmp_path):
+    # Step 5-1: a holdout written with free-form answers is not read until converted.
+    from webfic.evaluation.golden import discover
+
+    (tmp_path / "story01").mkdir()
+    (tmp_path / "story01" / "expected.yaml").write_text("title: x", "utf-8")
+    (tmp_path / "story07").mkdir()
+    (tmp_path / "story07" / "answers.txt").write_text("…", "utf-8")
+    assert [d.name for d in discover(tmp_path)] == ["story01"]

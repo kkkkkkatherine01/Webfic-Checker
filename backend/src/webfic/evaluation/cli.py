@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import re
 import subprocess
 from collections import Counter
 from datetime import datetime
@@ -25,6 +26,13 @@ app = typer.Typer(help="用黄金测试集评估抽取与检查效果", no_args_
 console = Console()
 
 EVAL_DIR = Path(__file__).resolve().parents[4] / "eval"
+
+
+def _file_label(label: str) -> str:
+    """A run label as part of a file name: characters Windows forbids become "-" (a
+    colon would otherwise write the result into an NTFS alternate stream)."""
+    return re.sub(r'[<>:"/\\|?*]', "-", label).strip() or "run"
+
 
 GoldenDir = Annotated[Path, typer.Option(help="黄金测试集目录")]
 
@@ -79,6 +87,28 @@ def _metrics_table(rows: list[Metrics]) -> Table:
     return table
 
 
+def _char_table(rows: list[Metrics]) -> Table | None:
+    """Character facts (step 5-1), when any story has them."""
+    dens = (
+        "char_issue_recall", "char_issue_precision", "trait_recall", "kinship_recall",
+        "death_recall", "char_trap_pass",
+    )  # fmt: skip
+    if not any(getattr(m, d).den for m in rows for d in dens):
+        return None
+    table = Table(
+        "篇目", "矛盾召回", "精确率", "外貌召回", "外貌全对", "亲属召回", "亲属全对",
+        "死亡召回", "死亡全对", "陷阱", title="人物事实", show_lines=False,
+    )  # fmt: skip
+    for m in rows:
+        table.add_row(
+            m.story, str(m.char_issue_recall), str(m.char_issue_precision), str(m.trait_recall),
+            str(m.trait_accuracy), str(m.kinship_recall), str(m.kinship_accuracy),
+            str(m.death_recall), str(m.death_accuracy), str(m.char_trap_pass),
+            style="bold" if m.story == "全部" else None,
+        )  # fmt: skip
+    return table
+
+
 def _print_details(overall: Metrics) -> None:
     if overall.failed_chapters:
         console.print(
@@ -90,6 +120,11 @@ def _print_details(overall: Metrics) -> None:
         console.print("\n[bold]漏报 / 不稳定的矛盾[/]（检出次数 / 采样次数）")
         for issue, hits in sorted(unstable.items()):
             console.print(f"  {issue}: {hits}/{overall.samples}")
+    if overall.char_allowed:
+        console.print(
+            f"\n人物事实：另有 {overall.char_allowed} 次报出标注允许或应由校验 agent 驳回的问题"
+            "（原文交代了原因），不算误报"
+        )
     if overall.false_positives:
         console.print("\n[bold]误报[/]")
         for desc, n in sorted(overall.false_positives.items(), key=lambda kv: -kv[1]):
@@ -174,11 +209,13 @@ def run(
     )
 
     console.print(_metrics_table([*per_story, overall]))
+    if (chars := _char_table([*per_story, overall])) is not None:
+        console.print(chars)
     _print_details(overall)
 
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{report.meta.created_at:%Y%m%d-%H%M%S}-{label}.json"
+    path = runs_dir / f"{report.meta.created_at:%Y%m%d-%H%M%S}-{_file_label(label)}.json"
     path.write_text(report.model_dump_json(indent=2), "utf-8")
     console.print(f"\n结果已保存：{path}")
     if baseline:
@@ -231,6 +268,9 @@ def compare(
         ("confidence_accuracy", "置信度"), ("age_recall", "年龄召回"),
         ("age_accuracy", "年龄全对"), ("elapsed_recall", "时间段召回"),
         ("elapsed_kind_accuracy", "推进/回顾"), ("trap_pass", "陷阱"),
+        ("char_issue_recall", "人物事实·矛盾召回"), ("char_issue_precision", "人物事实·精确率"),
+        ("trait_recall", "外貌召回"), ("kinship_recall", "亲属召回"),
+        ("death_recall", "死亡召回"), ("char_trap_pass", "人物事实·陷阱"),
     ]:  # fmt: skip
         ra, rb = getattr(old.overall, field), getattr(new.overall, field)
         table.add_row(name, str(ra), str(rb), _delta(ra, rb))
@@ -385,7 +425,7 @@ def realtext(
 
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-realtext-{label}.json"
+    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-realtext-{_file_label(label)}.json"
     path.write_text(report.model_dump_json(indent=2), "utf-8")
     console.print(f"\n结果已保存：{path}")
     if baseline:
@@ -488,13 +528,22 @@ def inject(
             await engine.dispose()
 
     views, outcomes = asyncio.run(main())
-    original = [i for v in views for i in v.issues]
+    everything = [i for v in views for i in v.issues]
+    original = [i for i in everything if i.checker == ij.AGE_CHECKER]
+    char_original = [i for i in everything if i.checker != ij.AGE_CHECKER]
     by_confidence = Counter(str(i.confidence) for i in original)
     console.print(
-        f"原文上的矛盾报告：{len(original)} 条（"
+        f"原文上的年龄矛盾报告：{len(original)} 条（"
         + "、".join(f"{k} {n}" for k, n in by_confidence.most_common())
         + "）"
     )
+    if char_original:
+        by_type = Counter(str(i.issue_type) for i in char_original)
+        console.print(
+            f"原文上的人物事实报告：{len(char_original)} 条（"
+            + "、".join(f"{k} {n}" for k, n in by_type.most_common())
+            + "）"
+        )
     if prepare_only:
         return
 
@@ -538,12 +587,13 @@ def inject(
         seed=seed or ij.SEED,
         books=len(views),
         original_issues=len(original),
+        original_char_issues=len(char_original),
         kinds=kinds,
         outcomes=outcomes,
     )
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-inject-{label}.json"
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-inject-{_file_label(label)}.json"
     path.write_text(report.model_dump_json(indent=2), "utf-8")
     console.print(f"\n结果已保存：{path}")
     if baseline:
@@ -692,7 +742,7 @@ def retrieval(
     )  # fmt: skip
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-retrieval-{label}.json"
+    path = runs_dir / f"{report.created_at:%Y%m%d-%H%M%S}-retrieval-{_file_label(label)}.json"
     path.write_text(report.model_dump_json(indent=2), "utf-8")
     console.print(f"\n结果已保存：{path}")
 
@@ -705,7 +755,10 @@ def verify_cmd(
     sets: Annotated[
         str, typer.Option(help="keep（真矛盾）、synthetic（合成误报）、real（真实报告，保留集）")
     ] = "keep,synthetic",
-    injected: Annotated[int, typer.Option(help="keep 集里注入的真矛盾条数")] = 40,
+    injected: Annotated[int, typer.Option(help="keep 集里注入的年龄真矛盾条数")] = 40,
+    injected_facts: Annotated[
+        int, typer.Option(help="keep 集里注入的人物事实真矛盾条数（5-1c）")
+    ] = 30,
     per_type: Annotated[int, typer.Option(help="合成误报每种类型的条数")] = 15,
     samples: Annotated[int, typer.Option(min=1, help="每条运行次数；>1 时自动绕过缓存")] = 1,
     fresh: Annotated[bool, typer.Option(help="绕过缓存，真实调用模型")] = False,
@@ -785,6 +838,20 @@ def verify_cmd(
                         if long
                         else "找不到注入评估的底稿，请先运行 webfic-eval inject --prepare-only"
                     )
+                if not long:
+                    # Test stories added since, and kinds of extraction added since.
+                    def extract(item):
+                        store = _LayeredStore(
+                            DbCallStore(factory, user_id=rv_user, book_id=None),
+                            DbCallStore(cache, user_id=None),
+                        )
+                        return platform_client(settings, store), settings
+
+                    from webfic.evaluation.retrieval import RETRIEVAL_USER as rv_user
+
+                    await ve.prepare_golden(
+                        factory, archival, EVAL_DIR / "golden", extract, console.print
+                    )
                 plan = [] if long else await ve.golden_cases(factory, EVAL_DIR / "golden")
                 plan += await ve.injected_cases(factory, books, 400)
                 plan += await ve.synthetic_cases(factory, books, 40, on_progress=console.print)
@@ -803,8 +870,11 @@ def verify_cmd(
                 for c in plan:
                     if c.kind.startswith("injected:"):
                         by_kind.setdefault(c.kind, []).append(c)
-                mixed = [c for group in zip_longest(*by_kind.values()) for c in group if c]
-                chosen += mixed[:injected]
+                ages = [v for k, v in by_kind.items() if not k.startswith("injected:fact_")]
+                facts = [v for k, v in by_kind.items() if k.startswith("injected:fact_")]
+                for groups, count in ((ages, injected), (facts, injected_facts)):
+                    mixed = [c for group in zip_longest(*groups) for c in group if c]
+                    chosen += mixed[:count]
             if "synthetic" in wanted:
                 chosen += [c for c in plan if c.kind == "golden:false_alarm"]
                 for kind in ve.CORRUPTIONS:
@@ -893,7 +963,7 @@ def verify_cmd(
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = runs_dir / f"{stamp}-verify-{label}.json"
+    path = runs_dir / f"{stamp}-verify-{_file_label(label)}.json"
     text = json.dumps(report, ensure_ascii=False, indent=1)
     path.write_text(text, "utf-8")
     console.print(f"\n结果已保存：{path}")
@@ -990,7 +1060,7 @@ def long_chapters_cmd(
     )
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{label}.json"
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{_file_label(label)}.json"
     path.write_text(
         json.dumps(
             {"label": label, "rows": [r.model_dump() for r in rows], "totals": total},
@@ -1086,9 +1156,181 @@ def author_notes_cmd(
         console.print(f"逐条核对：{page}")
     runs_dir = EVAL_DIR / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
-    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{label}.json"
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{_file_label(label)}.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=1), "utf-8")
     console.print(f"\n结果已保存：{path}")
+
+
+@app.command("probe")
+def probe_cmd(
+    books: Annotated[int, typer.Option(help="抽几部 WebNovelBench（每部全部 10 章）")] = 8,
+    private_chapters: Annotated[int, typer.Option(help="eval/private 每部取前几章")] = 20,
+    concurrency: Annotated[int, typer.Option(min=1, help="同时处理的章节数")] = 6,
+    label: Annotated[str, typer.Option(help="本次运行的说明，用于文件名")] = "probe",
+) -> None:
+    """试探性调查（5-1a）：真实文本里有哪些人物设定事实、同一角色写到两次以上的比例、前后说法不同的有哪些。"""
+    import json
+
+    from webfic.evaluation import probe as pb
+    from webfic.evaluation.realtext import shushan_book, webnovelbench_books
+    from webfic.llm.cache import DbCallStore
+
+    settings = get_settings()
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    external, private = EVAL_DIR / "external", EVAL_DIR / "private" / "published work"
+    wnb = webnovelbench_books(external / "webnovelbench" / "novel_data_subset_d_100.json")
+    samples = pb.choose(
+        [(b.name, b.text) for b in wnb],
+        shushan_book(external / "shushan" / "shushan_001-012.txt").text,
+        {f"private/{p.stem}": p.read_text("utf-8-sig") for p in sorted(private.glob("*.txt"))},
+        books=books, private_chapters=private_chapters,
+    )  # fmt: skip
+    console.print(
+        f"{len(samples)} 章（{len({s.book for s in samples})} 部），"
+        f"{sum(len(s.text) for s in samples)} 字"
+    )
+
+    async def main():
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+        return await pb.read(
+            platform_client(settings, DbCallStore(cache, user_id=None)), samples,
+            concurrency=concurrency,
+        )  # fmt: skip
+
+    found = asyncio.run(main())
+    stats = pb.stats(found)
+    table = Table(title=f"人物设定事实（{pb.PROMPT_VERSION}）")
+    for column in ("类别", "条数", "现在时", "角色数", "角色·属性", "写到 ≥2 章", "说法不同"):
+        table.add_column(column)
+    for c in stats:
+        table.add_row(
+            c.category, str(c.facts), str(c.present), str(c.characters), str(c.groups),
+            f"{c.repeated}（{c.repeated / c.groups:.0%}）" if c.groups else "0",
+            str(c.differing),
+        )  # fmt: skip
+    console.print(table)
+    common = "、".join(f"{c}·{a} {n}" for c, a, n in pb.attributes(found))
+    console.print(f"\n最常见的属性：{common}")
+    for c in stats:
+        if c.examples:
+            console.print(f"\n[bold]{c.category}：说法不同的例子[/]")
+            for line in c.examples:
+                console.print(f"  {line}")
+    report = {
+        "label": label, "prompt": pb.PROMPT_VERSION, "created_at": datetime.now().isoformat(),
+        "samples": [{"book": s.book, "chapter": s.chapter} for s in samples],
+        "stats": [c.model_dump() for c in stats],
+        "by_book": {b: dict(c) for b, c in pb.by_book(found).items()},
+        "facts": [f.model_dump() for f in found],
+    }  # fmt: skip
+    runs_dir = EVAL_DIR / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{datetime.now():%Y%m%d-%H%M%S}-probe-{_file_label(label)}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=1), "utf-8")
+    console.print(f"\n结果已保存：{path}")
+
+
+@app.command("review")
+def review_cmd(
+    checker: Annotated[str, typer.Option(help="检查器（consistency_issues.checker）")] = (
+        "character_facts"
+    ),
+    verify: Annotated[bool, typer.Option(help="先用校验 agent 核实还没核实过的问题")] = True,
+    out: Annotated[Path | None, typer.Option(help="审阅页路径")] = None,
+    sample: Annotated[int, typer.Option(help="被驳回的问题里抽几条请人核对（0：全部列出）")] = 30,
+) -> None:
+    """原文报告审阅页（5-1c）：注入底稿上某个检查器报出的问题 + 校验 agent 的结论，供人工核对。"""
+    from webfic.archival.index import platform_archival, reindex_book
+    from webfic.evaluation import inject as ij
+    from webfic.evaluation import review as rv
+    from webfic.evaluation import verify_eval as ve
+    from webfic.llm.cache import DbCallStore
+    from webfic.services.verification import verify_issues
+
+    settings = get_settings()
+    try:
+        platform_client(settings)
+    except LLMNotConfigured as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    path = out or EVAL_DIR / "external" / "inject" / f"review-{checker.replace('_', '-')}.html"
+
+    async def main():
+        from sqlalchemy import select
+
+        from webfic.db.models import IssueRow
+        from webfic.db.session import make_engine, make_session_factory
+
+        engine = make_engine(settings.database_url)
+        factory = make_session_factory(engine)
+        cache = await open_cache(EVAL_DIR / ".cache" / "llm.sqlite")
+        version = load_prompt_version(settings)
+        try:
+            async with factory() as session:
+                books = await ve._books(session, ij.INJECT_USER, "@" + version[:8])
+                ids = {
+                    name: list(
+                        await session.scalars(
+                            select(IssueRow.id).where(
+                                IssueRow.user_id == ij.INJECT_USER,
+                                IssueRow.book_id == book_id,
+                                IssueRow.checker == checker,
+                                IssueRow.status.in_(["open", "acknowledged"]),
+                            )
+                        )
+                    )
+                    for name, book_id in books.items()
+                }
+            cost = 0
+            if verify:
+                archival = platform_archival(settings)
+                for name, issue_ids in sorted(ids.items()):
+                    if not issue_ids:
+                        continue
+                    book_id = books[name]
+                    await reindex_book(factory, archival, user_id=ij.INJECT_USER, book_id=book_id)
+                    store = _LayeredStore(
+                        DbCallStore(factory, user_id=ij.INJECT_USER, book_id=book_id),
+                        DbCallStore(cache, user_id=None),
+                    )
+                    result = await verify_issues(
+                        factory, platform_client(settings, store), settings,
+                        user_id=ij.INJECT_USER, book_id=book_id, issue_ids=issue_ids,
+                        archival=archival,
+                    )  # fmt: skip
+                    cost += result.cost_usd
+                    console.print(f"{name}：核实 {len(result.verified)} 条，${result.cost_usd:.4f}")
+            items = await rv.collect(factory, books, ij.INJECT_USER, checker)
+            return items, cost
+        finally:
+            await engine.dispose()
+
+    items, cost = asyncio.run(main())
+    shown, rest = rv.choose(items, sample) if sample else (items, [])
+    kept = sum(
+        1 for it in items if not (it.verification and it.verification.verdict == "false_alarm")
+    )
+    intro = (
+        f"注入底稿（{len({it.book for it in items})} 部有报告）上检查器 {checker} 共报出 "
+        f"{len(items)} 条，校验 agent 保留 {kept} 条、驳回 {len(items) - kept} 条。"
+        f"下面是保留的 {kept} 条和按类型抽样的 {len(shown) - kept} 条被驳回的（固定种子）。"
+        "请逐条判断：真矛盾 / 误报 / 存疑（写编号和判断即可）。你的判断给出这一类检查在真实文本上的"
+        "精确率和校验 agent 误驳的比例，也会作为校验 agent 的保留集标注。"
+    )
+    page = rv.page(shown, title=f"原文报告核对：{checker}", intro=intro, rest=rest)
+    path.write_text(page, "utf-8")
+    console.print(f"{len(items)} 条；核实花费 ${cost:.4f}；审阅页：{path}")
+
+
+def load_prompt_version(settings) -> str:
+    """The age-extraction version tag the base books' titles carry."""
+    from webfic.extraction.extractor import extraction_version
+
+    return extraction_version(load_prompt(), settings.chunk_size, settings.chunk_overlap)
 
 
 if __name__ == "__main__":

@@ -23,15 +23,9 @@ from webfic.agent.budget import Budget
 from webfic.agent.loop import run_agent
 from webfic.agent.tools import ToolContext
 from webfic.agent.trace import TraceWriter
-from webfic.agent.verify import (
-    PROMPT_VERSION,
-    describe_fact,
-    describe_span,
-    load_prompt,
-    verify_tools,
-)
+from webfic.agent.verify import load_prompt, prompt_for, tools_for
 from webfic.archival.index import Archival
-from webfic.checkers.types import Confidence, IssueStatus
+from webfic.checkers.types import Confidence, IssueStatus, IssueType
 from webfic.config import Settings
 from webfic.db.models import (
     Book,
@@ -43,10 +37,20 @@ from webfic.db.models import (
     IssueRow,
     IssueVerificationRow,
 )
+from webfic.facts.describe import describe_span
+from webfic.facts.registry import AGE, APPEARANCE, KINSHIP, LIFE, describe_fact
 from webfic.llm.base import LLMClient, Tier
 from webfic.services.errors import NotFound
 
 Factory = async_sessionmaker[AsyncSession]
+
+# The kind of fact an issue's evidence quotes, by issue type (step 5-1).
+_CATEGORY = {
+    IssueType.CHARACTER_AGE: AGE.name,
+    IssueType.FACT_APPEARANCE: APPEARANCE.name,
+    IssueType.CHARACTER_KINSHIP: KINSHIP.name,
+    IssueType.TIMELINE_REVIVAL: LIFE.name,
+}
 
 _CONFIDENCE = {
     Confidence.CONFIRMED: "确定矛盾",
@@ -155,7 +159,9 @@ async def build_task(
             f"[{n}] 第 {e['chapter_number']} 章 {e['char_start']}–{e['char_end']}「{e['quote']}」"
         )
         lines.append(where)
-        lines += await _describe_evidence(session, user_id, book_id, e, subjects)
+        lines += await _describe_evidence(
+            session, user_id, book_id, e, subjects, _CATEGORY.get(issue.issue_type, AGE.name)
+        )
     lines += ["", "请核实后调用 submit_verdict 提交结论。"]
     return "\n".join(lines)
 
@@ -166,10 +172,12 @@ async def _describe_evidence(
     book_id: uuid.UUID,
     e: dict[str, Any],
     subjects: set[uuid.UUID],
+    category: str,
 ) -> list[str]:
     same_place = (
         FactRow.user_id == user_id,
         FactRow.book_id == book_id,
+        FactRow.category == category,
         FactRow.chapter_number == e["chapter_number"],
         FactRow.char_start == e["char_start"],
         FactRow.char_end == e["char_end"],
@@ -222,7 +230,7 @@ async def verify_issues(
     archival: Archival | None = None,
     budget: Budget | None = None,
     trace_factory: Factory | None = None,
-    prompt_version: str = PROMPT_VERSION,
+    prompt_version: str | None = None,
 ) -> VerifyResult:
     """Run the verify agent on the book's open and acknowledged issues that have no
     valid verdict yet (all of them with `again`), one after another. `trace_factory`
@@ -245,23 +253,28 @@ async def verify_issues(
         todo = [(i, verification_key(i, hashes)) for i in issues if i.id not in valid]
         tasks = {i.id: await build_task(session, user_id, book_id, i) for i, _ in todo}
 
-    system = load_prompt(prompt_version)
-    tools = verify_tools()
     context = ToolContext(factory=factory, user_id=user_id, book_id=book_id, archival=archival)
-    config = {
-        "prompt": prompt_version,
-        "model": settings.llm_verify_model,
-        "extra": settings.llm_verify_extra,
-    }
+    prompts: dict[str, str] = {}  # version -> text
     verified: list[IssueOutcome] = []
     cost = Decimal(0)
     for issue, key in todo:
+        # Each checker's issues have their own prompt; `prompt_version` overrides it for
+        # all (evaluation of a new prompt).
+        version = prompt_version or prompt_for(issue.checker)
+        if version not in prompts:
+            prompts[version] = load_prompt(version)
+        config = {
+            "prompt": version,
+            "model": settings.llm_verify_model,
+            "extra": settings.llm_verify_extra,
+            "issue_id": str(issue.id),
+        }
         result = await run_agent(
-            llm, agent="verify", system=system, task=tasks[issue.id], tools=tools,
+            llm, agent="verify", system=prompts[version], task=tasks[issue.id],
+            tools=tools_for(version),
             context=context,
             trace=TraceWriter(trace_factory or factory, user_id=user_id, book_id=book_id),
-            budget=budget, tier=Tier.VERIFY, subject=issue.fingerprint,
-            config={**config, "issue_id": str(issue.id)},
+            budget=budget, tier=Tier.VERIFY, subject=issue.fingerprint, config=config,
         )  # fmt: skip
         answer = result.result or {}
         row = IssueVerificationRow(
@@ -269,7 +282,7 @@ async def verify_issues(
             run_id=result.run_id, status=result.status, verdict=answer.get("verdict"),
             reason=answer.get("reason"), explanation=answer.get("explanation") or result.error,
             evidence=answer.get("evidence", []), model=settings.llm_verify_model,
-            prompt_version=prompt_version, cost_usd=result.spend.cost_usd,
+            prompt_version=version, cost_usd=result.spend.cost_usd,
             # Set here, to the microsecond: the latest valid verdict wins, and the
             # database's own timestamp is only to the second on SQLite.
             created_at=datetime.now(UTC),

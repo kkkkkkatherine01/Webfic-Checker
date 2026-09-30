@@ -82,6 +82,7 @@ class ElapsedFact:
     char_start: int
     char_end: int
     kind: str = "advance"
+    chapter_id: uuid.UUID | None = None
 
     @property
     def pos(self) -> tuple[int, int]:
@@ -94,6 +95,7 @@ def _evidence(fact: AgeFact | ElapsedFact) -> Evidence:
         quote=fact.raw_text,
         char_start=fact.char_start,
         char_end=fact.char_end,
+        chapter_id=fact.chapter_id,
     )
 
 

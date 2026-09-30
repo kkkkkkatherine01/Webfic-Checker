@@ -25,13 +25,14 @@ from webfic.evaluation.golden import Story
 from webfic.evaluation.matching import (
     ModelAge,
     ModelCharacter,
+    ModelCharFact,
     ModelElapsed,
     ModelIssue,
     Observation,
     score_story,
 )
 from webfic.evaluation.metrics import SampleResult
-from webfic.facts.registry import AGE
+from webfic.facts.registry import AGE, APPEARANCE, KINSHIP, LIFE
 from webfic.llm.base import LLMClient
 from webfic.llm.cache import DbCallStore
 from webfic.llm.client import CallRecord, CallStore
@@ -113,6 +114,14 @@ async def _observe(factory: Factory, book_id: uuid.UUID, dropped: int) -> Observ
                 select(FactRow).where(FactRow.book_id == book_id, FactRow.category == AGE.name)
             )
         ).all()
+        char_facts = (
+            await session.scalars(
+                select(FactRow).where(
+                    FactRow.book_id == book_id,
+                    FactRow.category.in_([APPEARANCE.name, KINSHIP.name, LIFE.name]),
+                )
+            )
+        ).all()
         elapsed = (
             await session.scalars(
                 select(ElapsedTimeFactRow).where(ElapsedTimeFactRow.book_id == book_id)
@@ -159,10 +168,28 @@ async def _observe(factory: Factory, book_id: uuid.UUID, dropped: int) -> Observ
                 chapters={e.chapter_number for e in i.evidence},
                 confidence=i.confidence,
                 description=i.description,
+                issue_type=i.issue_type,
             )
             for i in report.issues
         ],
         dropped=dropped,
+        char_facts=[
+            ModelCharFact(
+                character_id=str(f.character_id),
+                category=f.category,
+                attribute=f.attribute,
+                chapter=f.chapter_number,
+                start=f.char_start,
+                end=f.char_end,
+                value=f.value_text,
+                flashback=f.is_flashback,
+                speculative=f.is_speculative,
+                disguised=bool((f.qualifiers or {}).get("disguised")),
+                temporary=bool((f.qualifiers or {}).get("temporary")),
+                other_name=(f.qualifiers or {}).get("other_name"),
+            )
+            for f in char_facts
+        ],
     )
 
 

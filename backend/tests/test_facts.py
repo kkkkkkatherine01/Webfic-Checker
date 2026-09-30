@@ -26,11 +26,11 @@ def test_age_attributes_follow_story_time():
 
 def test_unregistered_kinds_are_rejected():
     with pytest.raises(UnknownFactKind):
-        change_rule("appearance", "eye_color")  # step 5
+        change_rule("realm", "level")  # step 5-2
     with pytest.raises(UnknownFactKind):
         change_rule(AGE.name, "height")
     with pytest.raises(UnknownFactKind):
-        validate_qualifiers("appearance", {})
+        validate_qualifiers("realm", {})
 
 
 def test_qualifiers_are_validated_by_the_category_model():
